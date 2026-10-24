@@ -189,7 +189,7 @@ pub fn recover(
 
     // --- Classify erasures -------------------------------------------------
     let data_blocks: Vec<Option<&Fragment>> = parsed[..k].iter().map(|o| o.as_ref()).collect();
-    let parity_blocks: Vec<Option<&Fragment>> = parsed[k..].iter().map(|o| o.as_ref()).collect();
+    let _parity_blocks: Vec<Option<&Fragment>> = parsed[k..].iter().map(|o| o.as_ref()).collect();
 
     let data_erasures = data_blocks.iter().filter(|o| o.is_none()).count();
     if data_erasures > r {
@@ -260,25 +260,19 @@ pub fn recover(
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let recovered_hash = hasher.finalize().into();
-    let exact_match = original_hash.map(|expected| {
-        let match_ = expected == recovered_hash;
-        if !match_ {
-            // fall through to error below via caller? report it instead.
-        }
-        match_
-    });
+    let exact_match = original_hash.map(|expected| expected == recovered_hash);
     let verify_ms = now_ms() - verify_start;
 
-    let mut report = RecoveryReport {
+    let report = RecoveryReport {
         blocks_total: n,
         blocks_parsed: parsed_count as usize,
         blocks_corrupted: corrupted as usize,
         blocks_missing: missing as usize,
         duplicates_removed: duplicates_removed as usize,
-        data_erasures: data_erasures,
-        data_recovered: k - data_erasures,
+        data_erasures,
+        data_recovered: if data_erasures <= k { k - data_erasures } else { 0 },
         unrecovered: false,
-        recovered_bytes: Some(bytes.clone()),
+        recovered_bytes: Some(bytes),
         recovered_hash: Some(recovered_hash),
         original_hash,
         exact_match,
@@ -295,7 +289,7 @@ pub fn recover(
     };
 
     if let Some(expected) = original_hash {
-        if Some(recovered_hash) != Some(expected) {
+        if recovered_hash != expected {
             return Err(RecoveryError::HashMismatch { expected, actual: recovered_hash });
         }
     }
@@ -316,44 +310,43 @@ pub fn recover_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::encode_bytes;
-    use crate::fragment::Fragment;
+    use crate::codec::{encode_bytes, Base};
+    use crate::fragment::{Fragment, FragmentKind};
+    use crate::storage::sha256_hex;
 
-    fn make_fragment(id: u64, offset: u64, data_index: u32, payload: Vec<u8>) -> Fragment {
-        let bases: Vec<crate::codec::Base> = payload.iter().flat_map(|b| {
-            let mut v = Vec::with_capacity(4);
-            for shift in (0..4).rev() {
-                v.push(crate::codec::Base((b >> (shift * 2)) & 0b11));
-            }
-            v
-        }).collect();
-        Fragment::new_data(id, data_index, 4, offset, bases)
-    }
-
-    fn archive_blocks(k: usize, r: usize, payloads: Vec<Vec<u8>>) -> Vec<Option<Vec<u8>>> {
-        let n = k + r;
-        let block_payload_size = payloads.iter().map(|p| p.len()).max().unwrap().next_multiple_of(16);
+    fn archive_blocks(k: usize, r: usize, payloads: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        let _n = k + r;
+        let block_payload_size = if payloads.is_empty() {
+            16
+        } else {
+            payloads.iter().map(|p| p.len()).max().unwrap().next_multiple_of(16)
+        };
         let mut fragments: Vec<Fragment> = Vec::new();
         let mut offset: u64 = 0;
         for (i, payload) in payloads.iter().enumerate() {
-            let bases: Vec<crate::codec::Base> = payload.iter().flat_map(|b| {
-                let mut v = Vec::with_capacity(4);
-                for shift in (0..4).rev() {
-                    v.push(crate::codec::Base((b >> (shift * 2)) & 0b11));
-                }
-                v
-            }).collect();
+            let bases: Vec<Base> = payload
+                .iter()
+                .flat_map(|b| {
+                    let mut v = Vec::with_capacity(4);
+                    for shift in (0..4).rev() {
+                        v.push(Base((b >> (shift * 2)) & 0b11));
+                    }
+                    v
+                })
+                .collect();
             fragments.push(Fragment::new_data(i as u64, i as u32, k as u32, offset, bases));
             offset += payload.len() as u64;
         }
-        let data_blocks: Vec<Vec<u8>> = fragments.iter().map(|f| serialize_block(f, block_payload_size)).collect();
+        let data_blocks: Vec<Vec<u8>> = fragments
+            .iter()
+            .map(|f| serialize_block(f, block_payload_size))
+            .collect();
         let rs = ReedSolomon::new(ReedSolomonConfig::new(k, r).unwrap()).unwrap();
         let refs: Vec<&[u8]> = data_blocks.iter().map(|b| b.as_slice()).collect();
         let parity = rs.encode(&refs).unwrap();
         let mut blocks: Vec<Option<Vec<u8>>> = data_blocks.into_iter().map(Some).collect();
         for (j, p) in parity.into_iter().enumerate() {
-            let mut frag = Fragment::new_parity((k + j) as u64, k as u32, 0, vec![crate::codec::Base(0); p.len()]);
-            // re-serialize with parity payload
+            let frag = Fragment::new_parity((k + j) as u64, k as u32, 0, vec![Base(0); p.len()]);
             let mut block = vec![0u8; HEADER_SIZE + block_payload_size];
             block[0..4].copy_from_slice(crate::fragment::FRAGMENT_MAGIC);
             block[4..6].copy_from_slice(&1u16.to_le_bytes());
@@ -361,7 +354,9 @@ mod tests {
             block[14..18].copy_from_slice(&(k as u32).to_le_bytes());
             block[18..22].copy_from_slice(&(p.len() as u32).to_le_bytes());
             block[22..26].copy_from_slice(&0u64.to_le_bytes());
-            let mut h = Sha256::new(); h.update(&p); block[26..58].copy_from_slice(&h.finalize());
+            let mut h = Sha256::new();
+            h.update(&p);
+            block[26..58].copy_from_slice(&h.finalize());
             block[58..62].copy_from_slice(&FragmentKind::Parity.flag_bits().to_le_bytes());
             block[62..62 + p.len()].copy_from_slice(&p);
             blocks.push(Some(block));
@@ -369,32 +364,35 @@ mod tests {
         blocks
     }
 
-    use crate::fragment::FragmentKind;
-
     #[test]
     fn recover_clean_archive() {
         let payloads: Vec<Vec<u8>> = vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9], vec![10, 11, 12]];
-        let blocks = archive_blocks(4, 2, payloads);
+        let blocks = archive_blocks(4, 2, &payloads);
         let mut hasher = Sha256::new();
-        for p in &payloads { hasher.update(p); }
+        for p in &payloads {
+            hasher.update(p);
+        }
         let hash = hasher.finalize().into();
         let config = RecoveryConfig { ecc_k: 4, ecc_r: 2, block_payload_size: 16, ..Default::default() };
         let report = recover_blocks(&blocks, &config, Some(hash)).unwrap();
         assert!(!report.unrecovered);
         assert!(report.exact_match == Some(true));
         let mut expected = Vec::new();
-        for p in &payloads { expected.extend_from_slice(p); }
+        for p in &payloads {
+            expected.extend_from_slice(p);
+        }
         assert_eq!(report.recovered_bytes.unwrap(), expected);
     }
 
     #[test]
     fn recover_with_data_erasure() {
         let payloads: Vec<Vec<u8>> = (0..4).map(|i| vec![i as u8; 8]).collect();
-        let blocks = archive_blocks(4, 2, payloads.clone());
-        let mut blocks = blocks;
+        let mut blocks = archive_blocks(4, 2, &payloads);
         blocks[1] = None; // drop data fragment 1
         let mut hasher = Sha256::new();
-        for p in &payloads { hasher.update(p); }
+        for p in &payloads {
+            hasher.update(p);
+        }
         let hash = hasher.finalize().into();
         let config = RecoveryConfig { ecc_k: 4, ecc_r: 2, block_payload_size: 16, ..Default::default() };
         let report = recover_blocks(&blocks, &config, Some(hash)).unwrap();
@@ -406,10 +404,12 @@ mod tests {
     #[test]
     fn recover_with_corrupted_block() {
         let payloads: Vec<Vec<u8>> = (0..4).map(|i| vec![i as u8; 8]).collect();
-        let mut blocks = archive_blocks(4, 2, payloads.clone());
+        let mut blocks = archive_blocks(4, 2, &payloads);
         blocks[2].as_mut().unwrap()[70] ^= 0xFF; // corrupt payload inside block
         let mut hasher = Sha256::new();
-        for p in &payloads { hasher.update(p); }
+        for p in &payloads {
+            hasher.update(p);
+        }
         let hash = hasher.finalize().into();
         let config = RecoveryConfig { ecc_k: 4, ecc_r: 2, block_payload_size: 16, ..Default::default() };
         let report = recover_blocks(&blocks, &config, Some(hash)).unwrap();
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn too_many_erasures_is_error() {
         let payloads: Vec<Vec<u8>> = (0..4).map(|i| vec![i as u8; 8]).collect();
-        let mut blocks = archive_blocks(4, 2, payloads);
+        let mut blocks = archive_blocks(4, 2, &payloads);
         blocks[0] = None;
         blocks[1] = None;
         blocks[2] = None; // 3 erasures > r=2
@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn hash_mismatch_reported() {
         let payloads: Vec<Vec<u8>> = vec![vec![1; 8], vec![2; 8], vec![3; 8], vec![4; 8]];
-        let blocks = archive_blocks(4, 2, payloads);
+        let blocks = archive_blocks(4, 2, &payloads);
         let config = RecoveryConfig { ecc_k: 4, ecc_r: 2, block_payload_size: 16, ..Default::default() };
         let err = recover_blocks(&blocks, &config, Some([0u8; 32])).unwrap_err();
         assert!(matches!(err, RecoveryError::HashMismatch { .. }));

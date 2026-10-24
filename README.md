@@ -1,396 +1,535 @@
-### DNAForge — Spesifikasi dan Deskripsi Lengkap Proyek
+# DNAForge
+
+Computational DNA data storage baseline written in Rust. Byte-to-DNA two-bit codec, Reed–Solomon erasure coding over GF(256), DNA channel error simulation (substitution, insertion, deletion, dropout, duplication), fragment-level SHA-256 integrity, constraint validation (GC content, homopolymer), and an end-to-end `encode → fragment → simulate → recover → verify` pipeline exposed through a CLI with CSV/JSON benchmark reporting.
+
+DNAForge adalah platform komputasi untuk menguji algoritma penyimpanan data berbasis DNA sintetis sebelum eksperimen laboratorium dilakukan. Ini bukan alat sintesis DNA fisik.
+
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache-2.0-blue.svg)](LICENSE)
+[![Rust stable](https://img.shields.io/badge/rust-stable-8A2BE2.svg)](https://www.rust-lang.org/)
+[![Edition 2024](https://img.shields.io/badge/edition-2024-orange.svg)](https://doc.rust-lang.org/edition-guide/)
+
+## 1. Tentang DNAForge
+
+Penyimpanan data DNA merepresentasikan informasi digital sebagai urutan basa adenin (A), sitosin (C), guanin (G), dan timin (T). Teoretis setiap basa mewakili dua bit dengan kepadatan informasi sangat tinggi, tetapi sistem nyata menghadapi efisiensi encoding, kesalahan pembacaan (substitusi, inserti, deleti), kehilangan fragmen, overhead redundansi, biaya komputasi, dan skalabilitas.
+
+DNAForge berfokus pada lapisan perangkat lunak:
+
+* Implementasi referensi DNA storage berbasis Rust stabil.
+* Pipeline encoding hingga pemulihan data yang dapat direproduksi.
+* Pengujian ketahanan algoritma terhadap berbagai model kesalahan DNA.
+* Pengukuran kecepatan, memori puncak, overhead, dan tingkat recovery.
+* Antarmuka CLI, format arsip eksperimen, pengujian otomatis, dan laporan benchmark.
+* Arsitektur modular yang dapat diperluas untuk data sequencing publik dan eksperimen laboratorium.
+
+Prinsip inti: DNAForge membedakan hasil yang diukur dari hasil simulasi atau proyeksi. Benchmark harus dapat direproduksi dan tidak mengklaim ketahanan biologis berdasarkan simulasi sederhana.
+
+## 2. Fitur utama
+
+| Fitur | Deskripsi |
+| --- | --- |
+| Codec | Konversi byte ke basa DNA dan sebaliknya dengan pemetaan dua bit (00 → A, 01 → C, 10 → G, 11 → T). |
+| Kanal simulasi | Substitusi, inserti, deleti, dropout fragmen, dan duplikasi dengan tingkat dan seed yang dapat dikonfigurasi. |
+| Fragmentasi | Blok versi dengan ID logis, panjang payload, offset, dan SHA-256 integritas per fragmen. |
+| Koreksi kesalahan | Reed–Solomon erasure coding over GF(256), toleransi hingga `r` erasure dengan `k` data fragmen. |
+| Validasi | Deteksi dan klasifikasi blok korup, hilang, dan duplikat; pemisahan deteksi dari koreksi. |
+| Batasan biologis | GC content, homopolymer, dan panjang urutan (pelaporan atau penolakan dalam mode ketat). |
+| Pemulihan | Parsing, autentikasi SHA-256, rekonstruksi erasure, susunan ulang stream, decode, verifikasi hash. |
+| CLI | Encode, decode, validate, simulate, recover, benchmark, dan inspect. |
+| Laporan | Ekspor eksperimen ke CSV dan ringkasan JSON dengan metrik performa dan ketahanan. |
+| Metrik | Throughput MiB/s, latensi per tahap, memori puncak (Linux), overhead penyimpanan, recovery rate. |
+
+## 3. Arsitektur
+
+```
+Digital input (file/biner)
+        │
+        ▼
+┌───────────────┐
+│ Codec         │ Bytes → DNA bases (2-bit)
+└───────────────┘
+        │
+        ▼
+┌───────────────┐
+│ Constraints   │ GC content, homopolymer, panjang urutan
+└───────────────┘
+        │
+        ▼
+┌───────────────┐
+│ Fragment      │ Blok versi, ID, SHA-256, data/parity
+└───────────────┘
+        │
+        ▼
+┌───────────────┐
+│ ECC (Reed–Solomon) │ Paritas fragmen, toleransi erasure
+└───────────────┘
+        │
+        ▼
+┌───────────────┐
+│ Channel       │ Substitusi, inserti, deleti, dropout, duplikasi
+└───────────────┘
+        │
+        ▼
+┌───────────────┐
+│ Recovery      │ Deteksi → koreksi erasure → susunan ulang → decode → verifikasi
+└───────────────┘
+        │
+        ▼
+┌───────────────┐
+│ Metrics / Report │ Throughput, memori, overhead, recovery rate, CSV/JSON
+└───────────────┘
+```
+
+DNAForge memiliki dua jalur evaluasi yang dilaporkan secara terpisah:
+
+* **Jalur performa** — biaya komputasi encoding, decoding, fragmentasi, dan pemulihan.
+* **Jalur ketahanan** — kemampuan sistem memulihkan data setelah diberi kesalahan terkontrol.
+
+Encoder yang cepat belum tentu menghasilkan data yang mudah dipulihkan.
+
+## 4. Modul inti
+
+| Modul | Tanggung jawab |
+| --- | --- |
+| `codec.rs` | Konversi byte ke basa DNA dan sebaliknya |
+| `channel.rs` | Model kesalahan DNA yang dapat dikonfigurasi |
+| `fragment.rs` | Pembagian data menjadi fragmen dengan ID dan metadata |
+| `recovery.rs` | Validasi, koreksi erasure, dan rekonstruksi data |
+| `metrics.rs` | Perhitungan metrik performa dan ketahanan |
+| `format.rs` (via `storage.rs`) | Format serialisasi untuk fragmen dan metadata |
+| `constraints.rs` | Validasi GC content, homopolymer, dan batasan urutan |
+| `ecc.rs` | Antarmuka algoritma Reed–Solomon error-correcting code |
+| `pipeline.rs` | Orkestrasi seluruh proses encoding sampai recovery |
+| `storage.rs` | Pembacaan dan penulisan arsip dengan dukungan fragmentasi |
+| `report.rs` | Ekspor hasil eksperimen ke CSV dan laporan ringkasan |
+| `main.rs` | Antarmuka command-line (clap) |
+| `benches/` | Benchmark komponen dan pipeline |
+| `tests/` | Uji integritas fungsional |
 
-DNAForge adalah proyek perangkat lunak untuk membangun sistem penyimpanan data digital berbasis DNA sintetis melalui simulasi komputasi, algoritma encoding/decoding, simulasi kesalahan, dan pemulihan data. Tujuan utamanya adalah meneliti bagaimana data digital dapat direpresentasikan sebagai urutan basa DNA, bagaimana data tersebut bertahan terhadap kesalahan yang terjadi selama proses penyimpanan dan pembacaan, serta bagaimana proses pemulihan dapat dibuat cepat, hemat memori, dan terukur.
+## 5. Pipeline akhir ke akhir
 
-DNAForge dirancang untuk dikembangkan terlebih dahulu tanpa perangkat sintesis DNA atau sequencer. Seluruh tahap awal dapat dilakukan di komputer menggunakan Rust, data sintetis, pengujian otomatis, dan benchmark. Hasilnya dapat menjadi fondasi penelitian sebelum sistem diintegrasikan dengan eksperimen laboratorium.
+1. **Encode** — file sumber diubah menjadi urutan DNA menggunakan skema yang dipilih; hash dan metadata awal dihitung.
+2. **Batasan biologis** — dalam mode biologis, urutan yang melanggar aturan desain diperbaiki atau ditolak.
+3. **Fragmentasi** — ditambahkan indeks, checksum, dan redundansi sesuai konfigurasi.
+4. **Simulasi kanal** — kesalahan diterapkan dengan seed dan tingkat kesalahan yang tercatat.
+5. **Pemulihan** — fragmen valid diidentifikasi, kesalahan dikoreksi jika memungkinkan, data disusun kembali.
+6. **Verifikasi** — hash hasil pemulihan dibandingkan dengan hash file asli.
+7. **Benchmark** — waktu, throughput, memori, overhead, dan keberhasilan recovery disimpan.
 
-1\. Encoding dan decoding
+Setiap tahap dapat dijalankan secara mandiri melalui CLI sehingga kegagalan dapat dilokalkan.
 
-Mengubah byte digital menjadi urutan basa DNA A, C, G, T dan mengembalikannya menjadi data semula.
+## 6. Model kesalahan kanal
 
-2\. Simulasi kanal DNA
+Simulator mendukung tingkat kesalahan yang dapat dikontrol dan menggunakan seed yang dapat diulang:
 
-Mensimulasikan substitusi, penyisipan, penghapusan, kehilangan fragmen, dan kesalahan lain yang dapat terjadi pada data DNA.
+* **Substitution** — basa berubah, misalnya A menjadi G.
+* **Insertion** — basa tambahan muncul.
+* **Deletion** — basa asli hilang.
+* **Dropout** — satu fragmen tidak tersedia pada proses pembacaan.
+* **Duplication** — fragmen terbaca lebih dari sekali.
+* **Mixed errors** — beberapa jenis kesalahan terjadi bersamaan.
 
-3\. Pemulihan data
+Setiap eksperimen mencatat jenis kesalahan, tingkat yang diminta, jumlah perubahan aktual, seed, serta panjang urutan sebelum dan sesudah simulasi. Model ini adalah model komputasi, bukan model laboratorium yang divalidasi; kesalahan nyata dapat bergantung pada konteks urutan, teknologi sequencing, dan proses kimia.
 
-Mengembangkan checksum, redundansi, kode koreksi kesalahan, dan rekonstruksi fragmen untuk memulihkan data yang rusak.
+## 7. Instalasi dan build
 
-4\. Benchmark dan optimasi
+Prasyarat: Rust stable (edition 2024) dan Cargo.
 
-Mengukur throughput, latensi, penggunaan memori, ukuran overhead, tingkat pemulihan, serta biaya komputasi.
+```bash
+# Clone repositori
+git clone <repositori>
+cd DNAForge
 
-### 1\. Latar belakang dan masalah yang ingin diselesaikan
+# Build dalam mode development
+cargo build
 
-Penyimpanan DNA memanfaatkan urutan empat basa—adenin (A), sitosin (C), guanin (G), dan timin (T)—untuk merepresentasikan informasi digital. Secara teori, setiap basa dapat mewakili dua bit sehingga kepadatan informasi potensialnya sangat tinggi.
+# Build dalam mode release (direkomendasikan untuk benchmark)
+cargo build --release
 
-Namun, sistem penyimpanan DNA menghadapi beberapa tantangan:
+# Jalankan seluruh pengujian unit
+cargo test
 
-* Efisiensi encoding: representasi digital harus diubah menjadi urutan DNA yang memenuhi batasan biologis.
+# Periksa format dan lint
+cargo fmt --check
+cargo clippy --all-targets
+```
 
-* Kesalahan pembacaan: substitusi, insertion, dan deletion dapat mengubah urutan DNA yang terbaca.
+Biner CLI dihasilkan di `target/release/dnaforge`.
 
-* Kehilangan fragmen: sebagian urutan dapat hilang atau tidak berhasil dibaca.
+## 8. Panduan cepat (CLI)
 
-* Overhead redundansi: koreksi kesalahan membutuhkan data tambahan, sehingga kapasitas efektif menurun.
+Semua perintah menggunakan pasangan `INPUT` dan `OUTPUT`.
 
-* Biaya komputasi: encoding, decoding, penyelarasan urutan, dan rekonstruksi data dapat menjadi mahal untuk dataset besar.
+### Encode file menjadi arsip DNAForge
 
-* Skalabilitas: sistem harus mampu menangani data dari kilobyte sampai gigabyte tanpa harus memuat seluruh data ke memori sekaligus.
+```bash
+./target/release/dnaforge encode input.bin archive/ \
+  --fragment-size 1024 \
+  --ecc-k 4 --ecc-r 2 \
+  --strict \
+  --gc-min 0.3 --gc-max 0.7 --max-homopolymer 5
+```
 
-DNAForge berfokus pada persoalan perangkat lunak tersebut. Proyek ini bukan alat untuk membuat DNA secara fisik, melainkan platform untuk menguji algoritma dan mengukur trade-off sebelum eksperimen biologis dilakukan.
+### Decode arsip kembali ke byte
 
-### 2\. Tujuan utama
+```bash
+./target/release/dnaforge decode archive/ output.bin
+```
 
-* Membuat implementasi referensi DNA storage berbasis Rust.
+### Validasi struktur, checksum, dan batasan arsip
 
-* Menyediakan pipeline encoding hingga pemulihan data yang dapat direproduksi.
+```bash
+./target/release/dnaforge validate archive/
+```
 
-* Menguji ketahanan algoritma terhadap berbagai model kesalahan DNA.
+### Simulasi kesalahan kanal pada arsip
 
-* Mengukur kecepatan, penggunaan memori, overhead, dan tingkat keberhasilan pemulihan.
+```bash
+./target/release/dnaforge simulate archive/ corrupted/ \
+  --sub 0.01 --ins 0.005 --del 0.005 \
+  --dropout 0.01 --dup 0.005 \
+  --seed 42
+```
 
-* Mengembangkan optimasi melalui streaming, multithreading, dan SIMD jika terbukti bermanfaat.
+### Pemulihan data (mengambil arsip yang mungkin korup)
 
-* Menyediakan antarmuka CLI, format data eksperimen, pengujian otomatis, dan laporan benchmark.
+```bash
+./target/release/dnaforge recover corrupted/ recovered.bin \
+  --original input.bin
+```
 
-* Menyiapkan arsitektur yang dapat diperluas untuk memakai data sequencing publik dan data eksperimen laboratorium.
+### Benchmark dan ekspor laporan
 
-Prinsip penting: DNAForge harus membedakan hasil yang benar-benar diukur dari hasil simulasi atau proyeksi. Benchmark harus bisa direproduksi dan tidak boleh mengklaim ketahanan biologis hanya berdasarkan simulasi sederhana.
+```bash
+./target/release/dnaforge benchmark input.bin report.csv \
+  --report report.csv \
+  --sizes "1KiB,64KiB,1MiB" \
+  --seeds "1,2,3" \
+  --ecc-k 4 --ecc-r 2 \
+  --sub 0.01 --seed 42
+```
 
-### 3\. Arsitektur sistem
+Format laporan ditentukan dari ekstensi berkas (`.csv` atau `.json`).
 
-DNAForge dibagi menjadi modul yang memiliki tanggung jawab terpisah agar algoritma dapat diganti, diuji, dan dioptimalkan tanpa harus menulis ulang keseluruhan sistem.
+### Inspect arsip
 
-### Digital Input
+```bash
+./target/release/dnaforge inspect archive/
+```
 
-File, arsip, teks, gambar, atau data biner
+## 9. Referensi CLI
 
-### Encoder
+| Perintah | Fungsi |
+| --- | --- |
+| `encode` | Encode file ke arsip DNA (byte → DNA → fragmen). |
+| `decode` | Decode arsip kembali ke byte. |
+| `validate` | Validasi struktur, checksum, dan batasan arsip. |
+| `simulate` | Simulasi kesalahan kanal pada arsip. |
+| `recover` | Pulihkan data dari (mungkin korup) arsip. |
+| `benchmark` | Benchmark encode/decode/recover dan ekspor CSV/JSON. |
+| `inspect` | Lihat manifest dan ringkasan per-fragmen arsip. |
 
-Bytes → DNA sequence → fragment berindeks
+Gunakan `dnaforge --help` dan `dnaforge <perintah> --help` untuk detail opsi lengkap.
 
-### DNA Channel Simulator
+## 10. Benchmark
 
-Substitution · Insertion · Deletion · Dropout
+Benchmark dijalankan pada eksekusi nyata, bukan proyeksi. Setiap skenario diulang dengan seed terdokumen dan melaporkan median serta variansi.
 
-### Decoder & Recovery Engine
+Grup eksperimen:
 
-Validasi · koreksi kesalahan · rekonstruksi fragmen
+* **A. Performa** — ukuran input 1 KiB, 64 KiB, 1 MiB, 16 MiB, 100 MiB (dan 1 GiB jika sumber daya memungkinkan); encoding/decoding, buffer baru versus reuse, satu thread versus multithread, memori penuh versus streaming, throughput, latensi, dan memori puncak.
+* **B. Ketahanan** — tingkat kesalahan 0 %, 0,1 %, 0,5 %, 1 %, 2 %, dan 5 % per jenis; dengan dan tanpa koreksi kesalahan, redundansi, berbagai ukuran fragmen, dan beberapa seed acak.
+* **C. Efisiensi penyimpanan** — bandingkan ukuran file asli dengan representasi DNA dan overhead sistem. Laporan kapasitas payload efektif, bukan hanya kepadatan teoritis dua bit per basa.
 
-### Recovered Data & Evaluation
+```
+Overhead = (Ukuran encoded − Ukuran payload) / Ukuran payload × 100 %
+```
 
-Verifikasi hash, throughput, memori, dan recovery rate
+Ukuran encoded mencakup semua metadata, indeks, dan redundansi yang diperlukan skema yang diuji.
 
-Arsitektur ini memiliki dua jalur evaluasi:
+## 11. Status proyek saat ini
 
-* Jalur performa: mengukur biaya komputasi encoding, decoding, fragmentasi, dan pemulihan.
+DNAForge versi `0.1.0` adalah baseline komputasi yang fungsional:
 
-* Jalur ketahanan: mengukur kemampuan sistem memulihkan data setelah diberi kesalahan terkontrol.
+* Codec dua bit dengan uji round-trip.
+* Simulator kanan kesalahan yang dapat dikonfigurasi dan deterministik.
+* Fragmentasi berbasis blok dengan SHA-256 dan versi format.
+* Koreksi erasure Reed–Solomon over GF(256).
+* Pipeline end-to-end encode → fragmentasi → simulasi kerusakan → recovery → verifikasi hash.
+* CLI lengkap dan laporan benchmark CSV/JSON.
+* Pengujian unit di setiap modul.
 
-Keduanya harus dilaporkan secara terpisah. Encoder yang sangat cepat belum tentu menghasilkan data yang mudah dipulihkan.
+**Belum terverifikasi sebagai sistem DNA storage lengkap.** Direktori `benches/` dan `tests/` masih kosong, dan workflow CI `.github/workflows` belum dikonfigurasi. Target angka untuk throughput, memori, atau recovery rate ditetapkan setelah baseline nyata diperoleh, bukan berdasarkan estimasi yang belum terbukti.
 
-### 4\. Modul inti
+## 12. Roadmap pengembangan
 
-Struktur yang disarankan untuk pengembangan bertahap.
+| Fase | Fokus | Syarat selesai |
+| --- | --- | --- |
+| 1 | Validasi — stabilkan baseline | Kompilasi, uji round-trip, validasi input, benchmark dapat direproduksi, pencatatan konfigurasi. Pengujian lulus dan berjalan konsisten. |
+| 2 | Recovery — fragmentasi dan koreksi kesalahan | ID fragmen, checksum, skema koreksi teruji, rekonstruksi, laporan exact-file recovery. Kerusakan terkontrol terdeteksi dan batas recovery diketahui. |
+| 3 | Biologis — desain urutan layak uji | Batasan GC content, homopolymer, panjang urutan, skema desain untuk target eksperimen. Urutan lolos validator dan asumsi biologis terdokumen. |
+| 4 | Optimasi — performa | Streaming, paralelisme, pengurangan alokasi, SIMD, uji memori. Optimasi dipertahankan hanya jika benchmark menunjukkan keuntungan nyata. Hasil sebelum dan sesudah dapat dibandingkan adil. |
+| 5 | Validasi — data nyata | Dataset sequencing publik, bandingkan model kesalahan dengan pembacaan tersedia. Kerja sama laboratorium untuk sintesis dan penyimpanan nyata. Hasil simulasi dibandingkan bukti empiris. |
 
-| Modul          | Tanggung jawab                                         |
-| -------------- | ------------------------------------------------------ |
-| codec.rs       | Konversi byte ke basa DNA dan sebaliknya               |
-| channel.rs     | Model kesalahan DNA yang dapat dikonfigurasi           |
-| fragment.rs    | Pembagian data menjadi fragmen dengan ID dan metadata  |
-| recovery.rs    | Validasi, koreksi, dan rekonstruksi data               |
-| metrics.rs     | Perhitungan metrik performa dan ketahanan              |
-| format.rs      | Format serialisasi untuk fragmen dan metadata          |
-| constraints.rs | Validasi GC content, homopolymer, dan batasan urutan   |
-| ecc.rs         | Antarmuka algoritma error-correcting code              |
-| pipeline.rs    | Orkestrasi seluruh proses encoding sampai recovery     |
-| storage.rs     | Pembacaan dan penulisan data dengan dukungan streaming |
-| report.rs      | Ekspor hasil eksperimen ke CSV dan laporan ringkasan   |
-| main.rs        | Antarmuka command-line                                 |
-| benches/       | Benchmark komponen dan pipeline                        |
+## 13. Kriteria keberhasilan
 
-### 4.1. Codec: konversi digital ke DNA
+| Dimensi | Kriteria |
+| --- | --- |
+| Kebenaran | File yang pulih sempurna memiliki hash identik dengan sumber. |
+| Ketahanan | Tingkat pemulihan diukur pada berbagai jenis dan tingkat kesalahan. |
+| Efisiensi | Throughput, memori puncak, dan overhead dicatat. |
+| Reproduksibilitas | Konfigurasi, seed, versi kode, dan hasil eksperimen tersimpan. |
 
-Versi baseline menggunakan pemetaan dua bit menjadi satu basa:
-
-| Bit | Basa |
-| --- | ---- |
-| 00  | A    |
-| 01  | C    |
-| 10  | G    |
-| 11  | T    |
-
-Contohnya, satu byte membutuhkan empat karakter DNA. Konversi tersebut mudah diuji, tetapi hanya berfungsi sebagai baseline komputasi.
-
-Pemetaan ini belum cukup untuk sintesis biologis. Dalam pengembangan selanjutnya, encoder perlu mempertimbangkan GC content, homopolymer, distribusi basa, batasan panjang urutan, dan kompatibilitas dengan skema koreksi kesalahan.
-
-### 4.2. Channel simulator: simulasi kerusakan
-
-Simulator harus mendukung tingkat kesalahan yang dapat dikontrol dan menggunakan seed yang dapat diulang.
-
-* Substitution: basa berubah, misalnya A menjadi G.
-
-* Insertion: basa tambahan muncul.
-
-* Deletion: basa asli hilang.
-
-* Dropout: satu fragmen tidak tersedia pada proses pembacaan.
-
-* Duplicate: fragmen terbaca lebih dari sekali.
-
-* Mixed errors: beberapa jenis kesalahan terjadi bersamaan.
-
-Setiap eksperimen perlu mencatat jenis kesalahan, tingkat kesalahan yang diminta, jumlah perubahan aktual, seed, serta panjang urutan sebelum dan sesudah simulasi.
-
-Model kesalahan independen adalah titik awal yang berguna, tetapi bukan representasi sempurna dari laboratorium. Kesalahan nyata dapat bergantung pada konteks urutan, teknologi sequencing, dan proses kimia.
-
-### 4.3. Fragment: pembagian dan pengindeksan
-
-File besar tidak seharusnya diubah menjadi satu urutan DNA tanpa struktur. DNAForge perlu membagi data menjadi fragmen yang memiliki:
-
-* ID fragmen dan posisi logis.
-
-* Panjang payload dan versi format.
-
-* Checksum atau hash untuk mendeteksi kerusakan.
-
-* Metadata untuk menyusun kembali urutan data.
-
-* Redundansi atau informasi pemulihan jika diperlukan.
-
-Ukuran fragmen merupakan parameter eksperimen. Fragmen kecil mempermudah pengelolaan kehilangan lokal, tetapi menambah overhead indeks dan metadata. Fragmen besar mengurangi overhead tersebut, tetapi dapat memperbesar biaya pemulihan ketika sebagian data rusak.
-
-### 4.4. Recovery engine: pemulihan data
-
-Inilah salah satu bagian terpenting DNAForge. Engine harus membedakan tiga kondisi:
-
-* Deteksi: sistem mengetahui data tidak valid.
-
-* Koreksi: sistem dapat menentukan data yang benar menggunakan redundansi yang tersedia.
-
-* Rekonstruksi: sistem dapat menyusun kembali file dari fragmen yang valid dan informasi pemulihan.
-
-Checksum biasa hanya mendeteksi banyak jenis kerusakan; checksum tidak dapat dengan sendirinya memperbaiki data yang rusak. Karena itu, DNAForge perlu membandingkan metode seperti Reed–Solomon, LDPC, fountain codes, atau metode lain sesuai model kesalahan dan struktur data.
-
-Untuk insertion dan deletion, koreksi lebih sulit karena posisi basa setelah kesalahan dapat bergeser. Sistem mungkin membutuhkan penyelarasan urutan, batasan desain, indeks fragmen, atau skema kode yang memang dirancang menghadapi kesalahan sinkronisasi.
-
-### 4.5. Metrics: pengukuran yang dapat dipercaya
-
-Modul metrik harus melaporkan setidaknya:
-
-* Waktu encoding dan decoding.
-
-* Throughput dalam MiB/s atau GiB/s.
-
-* Latensi per fragmen dan per file.
-
-* Penggunaan memori puncak.
-
-* Rasio ukuran DNA terhadap ukuran file sumber.
-
-* Overhead indeks, metadata, dan koreksi kesalahan.
-
-* Persentase fragmen yang berhasil dipulihkan.
-
-* Persentase file yang dipulihkan dengan hash identik.
-
-* Tingkat kegagalan dan jumlah eksperimen yang tidak berhasil.
-
-Untuk eksperimen ketahanan, recovery rate per fragmen tidak sama dengan exact-file recovery rate. File hanya dianggap pulih sempurna jika seluruh byte hasil rekonstruksi cocok dengan sumber aslinya.
-
-### 5\. Alur kerja lengkap
-
-* Masukkan file sumber. Hitung ukuran, hash, dan metadata awal.
-
-* Encode. Ubah byte menjadi urutan DNA menggunakan skema yang dipilih.
-
-* Terapkan batasan biologis. Pada mode biologis, perbaiki atau tolak urutan yang melanggar aturan desain.
-
-* Fragmentasikan. Tambahkan indeks, checksum, dan redundansi sesuai konfigurasi.
-
-* Simulasikan kanal. Terapkan kesalahan dengan seed dan tingkat kesalahan yang tercatat.
-
-* Pulihkan. Identifikasi fragmen valid, koreksi kesalahan jika memungkinkan, dan susun kembali data.
-
-* Verifikasi. Bandingkan hash hasil pemulihan dengan hash file asli.
-
-* Benchmark. Simpan waktu, throughput, memori, overhead, dan keberhasilan recovery.
-
-Setiap tahap harus bisa dijalankan secara mandiri agar kegagalan dapat dilokalisasi. Misalnya, bila hash akhir berbeda, laporan harus membantu membedakan kesalahan encoder, kehilangan fragmen, kegagalan koreksi, dan kesalahan rekonstruksi.
-
-### 6\. Teknologi dan pilihan implementasi
-
-DNAForge menggunakan Rust sebagai bahasa utama untuk mendapatkan kontrol atas memori, performa yang konsisten, dan kemampuan membangun aplikasi CLI mandiri.
-
-| Komponen                | Pilihan                                                                                  |
-| ----------------------- | ---------------------------------------------------------------------------------------- |
-| Bahasa utama            | Rust stable                                                                              |
-| Build system            | Cargo                                                                                    |
-| Benchmark               | Criterion                                                                                |
-| Pengujian               | Rust unit tests, integration tests, property-based tests                                 |
-| Data eksperimen         | CSV dan metadata konfigurasi                                                             |
-| Format checksum         | SHA-256 untuk verifikasi file; checksum cepat dapat digunakan untuk pemeriksaan internal |
-| Paralelisasi            | Rayon atau thread pool khusus, setelah baseline stabil                                   |
-| Optimasi                | Iterator, buffer reuse, streaming, SIMD                                                  |
-| Integrasi data biologis | Parser FASTQ/FASTA dan dataset sequencing publik                                         |
-| Antarmuka               | CLI terlebih dahulu, API library setelah stabil                                          |
-
-Versi Rust dan versi dependensi harus dikunci dalam proyek. Pengujian CI sebaiknya dijalankan pada Linux dan Windows, dengan benchmark performa dipisahkan dari pengujian fungsional.
-
-### 7\. Status proyek saat ini
-
-Berdasarkan implementasi awal yang sudah dirancang, DNAForge memiliki fondasi benchmark untuk konversi data dan simulasi kesalahan sederhana. Namun, fondasi tersebut belum sama dengan sistem DNA storage yang lengkap.
-
-Fondasi awal
-
-Pemetaan byte–DNA, pengujian round-trip, simulator kesalahan sederhana, metrik throughput, CLI benchmark, dan ekspor CSV telah dirancang dalam paket awal.
-
-Belum terverifikasi
-
-Paket awal belum dikonfirmasi berhasil dikompilasi dan dijalankan pada mesin pengguna. Hasil benchmark yang sebelumnya dibahas adalah ilustrasi, bukan pengukuran nyata dari program.
-
-Pengembangan inti berikutnya
-
-Koreksi kesalahan sesungguhnya, fragmentasi, validasi hash, desain urutan yang kompatibel dengan DNA sintetis, dan benchmark penggunaan memori.
-
-Paket awal yang telah dibuat dalam percakapan ini: DNAForge Benchmark Suite (.zip).
-
-### 8\. Rencana benchmark yang lengkap
-
-Benchmark DNAForge sebaiknya mempunyai beberapa kelompok eksperimen yang terpisah.
-
-### A. Benchmark performa
-
-Uji ukuran input 1 KiB, 64 KiB, 1 MiB, 16 MiB, 100 MiB, dan kemudian 1 GiB jika sumber daya komputer memungkinkan.
-
-* Encoding dan decoding.
-
-* Operasi dengan buffer baru versus buffer yang digunakan ulang.
-
-* Pemrosesan satu thread versus multithread.
-
-* Mode seluruh data di memori versus streaming.
-
-* Throughput, latensi, dan penggunaan memori puncak.
-
-### B. Benchmark ketahanan
-
-Uji tingkat kesalahan, misalnya 0%, 0,1%, 0,5%, 1%, 2%, dan 5%, untuk tiap jenis kesalahan secara terpisah sebelum menguji kombinasi.
-
-Variabel yang perlu dibandingkan:
-
-* Tanpa koreksi kesalahan.
-
-* Deteksi kerusakan dengan checksum.
-
-* Koreksi kesalahan menggunakan skema yang dipilih.
-
-* Redundansi untuk menghadapi fragmen yang hilang.
-
-* Berbagai ukuran fragmen dan jumlah salinan.
-
-* Beberapa seed acak pada setiap kondisi.
-
-### C. Benchmark efisiensi penyimpanan
-
-Bandingkan ukuran file asli dengan ukuran representasi DNA dan overhead sistem. Laporkan kapasitas payload efektif, bukan hanya kepadatan teoritis dua bit per basa.
-
-Metrik utamanya adalah:
-
-\\text{Overhead} =
-\\frac{\\text{Ukuran encoded}-\\text{Ukuran payload}}
-{\\text{Ukuran payload}}\\times100\\%
-
-Ukuran encoded harus mencakup semua metadata, indeks, dan redundansi yang memang diperlukan oleh skema yang diuji. Jika biaya sintesis atau sequencing tidak dimodelkan, biaya tersebut harus dilaporkan terpisah.
-
-### D. Benchmark statistik
-
-Setiap skenario harus dijalankan berulang kali dengan seed terdokumentasi. Laporkan median, variasi, jumlah percobaan, dan interval ketidakpastian jika memungkinkan.
-
-Satu hasil yang sukses tidak cukup untuk membuktikan bahwa sebuah skema andal pada tingkat kesalahan tertentu.
-
-### 9\. Roadmap pengembangan
-
-### Fase 1
-
-Validasi
-
-Stabilkan baseline
-
-Kompilasi, pengujian round-trip, validasi input, benchmark yang dapat direproduksi, dan pencatatan konfigurasi. Semua hasil harus dapat diverifikasi.
-
-Syarat selesai: pengujian lulus dan benchmark berjalan konsisten.
-
-### Fase 2
-
-Recovery
-
-Bangun fragmentasi dan koreksi kesalahan
-
-Implementasikan ID fragmen, checksum, skema koreksi yang teruji, rekonstruksi, dan laporan exact-file recovery.
-
-Syarat selesai: kerusakan terkontrol dapat dideteksi dan batas kemampuan pemulihan diketahui.
-
-### Fase 3
-
-Biologis
-
-Desain urutan DNA yang layak diuji
-
-Tambahkan batasan GC content, homopolymer, panjang urutan, dan skema desain yang sesuai dengan target eksperimen.
-
-Syarat selesai: urutan lolos validator dan asumsi biologis terdokumentasi.
-
-### Fase 4
-
-Optimasi
-
-Optimasi performa
-
-Streaming, paralelisasi, pengurangan alokasi, SIMD, dan pengujian penggunaan memori. Optimasi hanya dipertahankan jika benchmark menunjukkan keuntungan nyata.
-
-Syarat selesai: hasil sebelum dan sesudah optimasi dapat dibandingkan secara adil.
-
-### Fase 5
-
-Validasi
-
-Evaluasi dengan data nyata
-
-Gunakan dataset sequencing publik, lalu bandingkan model kesalahan dengan hasil pembacaan yang tersedia. Kerja sama laboratorium menjadi langkah lanjutan bila ingin menguji proses sintesis dan penyimpanan nyata.
-
-Syarat selesai: hasil simulasi dibandingkan dengan bukti empiris yang relevan.
-
-### 10\. Kriteria keberhasilan proyek
-
-DNAForge tidak seharusnya hanya dinilai berdasarkan kecepatan encoder. Kriteria keberhasilan perlu mencakup empat dimensi.
-
-| Dimensi           | Kriteria                                                           |
-| ----------------- | ------------------------------------------------------------------ |
-| Kebenaran         | File yang pulih sempurna memiliki hash identik dengan sumber       |
-| Ketahanan         | Tingkat pemulihan diukur pada berbagai jenis dan tingkat kesalahan |
-| Efisiensi         | Throughput, memori puncak, dan overhead dicatat                    |
-| Reproduksibilitas | Konfigurasi, seed, versi kode, dan hasil eksperimen tersimpan      |
-
-Target angka untuk throughput, memori, atau recovery rate sebaiknya ditentukan setelah baseline yang nyata diperoleh. Dengan begitu, target optimasi tidak didasarkan pada angka perkiraan yang belum terbukti.
-
-### 11\. Batasan dan risiko teknis
+## 14. Batasan dan risiko teknis
 
 * Simulasi bukan eksperimen biologis. Kanal acak sederhana tidak sepenuhnya mencerminkan proses sintesis, penyimpanan, amplifikasi, dan sequencing.
-
 * Kapasitas teoritis bukan kapasitas efektif. Metadata, batasan biologis, indeks, dan koreksi kesalahan mengurangi kapasitas payload.
-
-* Error correction memiliki trade-off. Koreksi lebih kuat biasanya memerlukan redundansi, waktu komputasi, atau keduanya.
-
-* Throughput harus dibuktikan. Angka benchmark harus berasal dari eksekusi nyata pada perangkat yang spesifik.
-
+* Koreksi kesalahan memiliki trade-off. Koreksi lebih kuat biasanya memerlukan redundansi, waktu komputasi, atau keduanya.
+* Throughput harus dibuktikan. Angka benchmark berasal dari eksekusi nyata pada perangkat yang spesifik.
 * Penyimpanan DNA fisik memerlukan mitra eksperimen. Software saja tidak membuktikan umur simpan, stabilitas kimia, atau keberhasilan sintesis.
 
-### 12\. Visi akhir DNAForge
+## 15. Kontribusi
 
-Tujuan jangka panjang DNAForge adalah menjadi framework riset DNA data storage yang modular, cepat, terukur, dan dapat direproduksi, dengan Rust sebagai fondasi implementasi.
+1. Fork repositori dan buat cabang fitur dari `main`.
+2. Tambahkan uji untuk fitur atau perbaikan baru.
+3. Pastikan `cargo test`, `cargo fmt --check`, dan `cargo clippy --all-targets` lulus.
+4. Buat pull request dengan deskripsi perubahan dan metrik yang relevan.
 
-Produk akhirnya idealnya mencakup library codec, engine koreksi kesalahan, simulator kanal, CLI eksperimen, format fragmen, benchmark suite, dan integrasi dengan data sequencing. Setelah validasi komputasi matang, DNAForge dapat menjadi fondasi untuk mengevaluasi desain penyimpanan DNA pada skala lebih besar.
+Laporkan bugs dan usulan fitur melalui Issues.
 
-Fokus paling tepat untuk tahap sekarang adalah menyelesaikan pipeline end-to-end yang benar terlebih dahulu: encode → fragmentasi → simulasi kerusakan → recovery → verifikasi hash → benchmark. Setelah jalur tersebut terbukti benar, barulah optimasi SIMD dan multithread menjadi prioritas.
+## 16. Referensi teknis detail
+
+### 16.1 Codec: konversi byte ke DNA
+
+Tipe `Base` mewakili satu basa sebagai nilai u8 0..3:
+
+| Nilai | Basa | Bit |
+| --- | --- | --- |
+| 0 | A | 00 |
+| 1 | C | 01 |
+| 2 | G | 10 |
+| 3 | T | 11 |
+
+Pemetaan dua bit ke satu basa. Setiap byte diubah menjadi tepat 4 basis, bit paling signifikan dulu (MSB-first). Untuk byte `b`, empat base dihasilkan dari pasangan bit pada shift 6, 4, 2, 0:
+
+```
+base[0] = (b >> 6) & 0b11
+base[1] = (b >> 4) & 0b11
+base[2] = (b >> 2) & 0b11
+base[3] = (b >> 0) & 0b11
+```
+
+Panjang output selalu `4 * input.len()`. Decoding mengelompokkan setiap 4 basis menjadi satu byte (MSB-first). Jika jumlah basis bukan kelipatan 4, decoding gagal dengan `CodecError::IncompleteByte`. Basis di luar rentang 0..3 gagal dengan `CodecError::InvalidBase`. Codec adalah bijeksi murni dan tidak menjamin properti biologis apa pun; properti tersebut ditangani oleh `constraints`.
+
+### 16.2 Format blok fragmen (arsip)
+
+Setiap fragmen diserialisasikan menjadi blok byte berukuran tetap: header 62 byte diikuti payload yang di-zero-padding ke `block_payload_size` (kelipatan 16, minimal 16).
+
+Tata letak header (semua integer little-endian):
+
+| Offset | Panjang | Field | Keterangan |
+| --- | --- | --- | --- |
+| [0..4] | 4 | Magic | `"DNAF"` |
+| [4..6] | 2 | Version | `u16` (saat ini 1) |
+| [6..14] | 8 | Fragment ID | `u64`, unik dalam arsip |
+| [14..18] | 4 | Total data | `u32`, jumlah fragmen data |
+| [18..22] | 4 | Payload length | `u32`, basis (tidak dipad) |
+| [22..26] | 4 | Offset basis | `u32`, posisi dalam stream DNA |
+| [26..58] | 32 | Payload hash | SHA-256 dari payload |
+| [58..62] | 4 | Flags | `u32`, bit 0 = parity |
+| [62..] | N | Payload | Nilai `Base` 0..3, zero-padded |
+
+`HEADER_SIZE = 62`. Ukuran blok terpisah adalah `HEADER_SIZE + block_payload_size`. Deserialisasi memvalidasi magic, versi, ukuran blok, panjang payload, dan cocokkan SHA-256 payload; gagal menghasilkan `FormatError` (BadMagic, UnsupportedVersion, BlockSizeMismatch, PayloadTooLarge, PayloadHashMismatch).
+
+### 16.3 Koreksi kesalahan Reed–Solomon (GF(256))
+
+Implementasi RS[n, k] atas GF(256) dengan polinomial primitif `0x11d` dan generator alpha = 2. Tabel exponent/log dibangun sekali secara statis melalui `LazyLock`.
+
+* `n = k + r <= 255` karena GF(256) memiliki 255 titik evaluasi non-nol.
+* Setiap posisi byte dalam blok adalah simbol GF(256) independen; blok N bytes di-encode sebagai N simbol RS paralel.
+* Paritas `r` dihitung melalui koefisien Lagrange `T[i][j] = L_i(alpha^(k+j))`.
+* Properti MDS: semua `k` dari `n` simbol mencukupi untuk rekonstruksi seluruh codeword, sehingga hingga `r = n - k` erasure dapat dikoreksi.
+* Ini adalah koreksi erasure (posisi hilang/korup diketahui melalui lapisan checksum), bukan koreksi substitusi pada posisi tidak diketahui. Substitusi/indeli di dalam fragment terdeteksi oleh SHA-256 dan diperlakukan sebagai erasure.
+
+`ReedSolomonConfig::new(k, r)` menolak `k == 0` atau `n > 255`.
+
+### 16.4 Simulator kanal DNA
+
+Simulator menggunakan `rand::rngs::StdRng::seed_from_u64` untuk output deterministik per seed dan input yang sama. Kesalahan diterapkan secara independen:
+
+* Substitusi, inserti, deleti: probabilitas per basis.
+* Dropout, duplikasi: probabilitas per fragmen.
+* Dropout menandai fragmen sebagai `None` (hilang). Duplikasi menghasilkan salinan tambahan identik.
+
+Tipe peristiwa `ErrorEvent`: Substitution (fragment_id, position, from, to), Insertion (fragment_id, position, base), Deletion (fragment_id, position, base), Dropout (fragment_id), Duplication (fragment_id). `ChannelConfig::validate` menolak setiap tingkat di luar rentang `[0, 1]`.
+
+Simulator adalah model komputasi, bukan model laboratorium tervalidasi. Kesalahan nyata dapat bergantung pada konteks urutan, teknologi sequencing, dan proses kimia.
+
+### 16.5 Pipeline pemulihan tahap demi tahap
+
+1. **Parsing & autentikasi** — setiap blok di-deserialisasi; magic, versi, ukuran, dan SHA-256 divalidasi. Blok hilang, korup, dan duplikat diklasifikasi.
+2. **Klasifikasi erasure** — fragmen data yang hilang/korup dihitung; jika melebihi redundansi `r`, pemulihan gagal dengan `TooManyErasures`.
+3. **Koreksi erasure Reed–Solomon** — blok yang tersisa dan paritas digunakan untuk merekonstruksi erasure. Setiap blok yang dikembalikan di-revalidasi dengan SHA-256.
+4. **Susunan ulang stream DNA** — fragmen data diurutkan berdasarkan `offset_bases`; posisi harus kontigu dan menutupi seluruh stream.
+5. **Decode DNA → byte** — 4 basis dikembalikan menjadi 1 byte via codec.
+6. **Validasi batasan** (opsional) — GC content dan homopolymer diperiksa terhadap `ConstraintConfig`.
+7. **Verifikasi** — SHA-256 hasil pemulihan dibandingkan dengan hash asli; ketidakcocokan menghasilkan `HashMismatch`.
+
+Setiap tahap diukur waktu (ms) dan dilaporkan dalam `StageTiming` (parse, ecc, reassemble, decode, verify, total).
+
+### 16.6 Format arsip dan manifest
+
+Arsip adalah direktori yang berisi:
+
+* `manifest.json` — metadata arsip.
+* `frag_{id:06}.bin` — blok fragmen data atau parity.
+* `frag_{id:06}_dup{N}.bin` — berkas duplikat (hasil simulasi duplikasi).
+
+`ArchiveManifest` berisi:
+
+| Field | Tipe | Keterangan |
+| --- | --- | --- |
+| format | String | `"dnaforge-archive"` |
+| version | u16 | Versi format fragmen |
+| original_size_bytes | u64 | Ukuran berkas asli |
+| original_sha256 | String | Hash SHA-256 heksadesimal asli |
+| dna_bases | u64 | Jumlah total basis DNA |
+| fragment_size_bases | u64 | Basis per payload fragmen |
+| block_payload_size | u64 | Ukuran payload blok (di-pad) |
+| header_size | u64 | `62` |
+| block_size | u64 | `header_size + block_payload_size` |
+| ecc_k | u64 | Jumlah fragmen data |
+| ecc_r | u64 | Jumlah fragmen paritas |
+| total_data | u64 | Jumlah fragmen data |
+| total_parity | u64 | Jumlah fragmen paritas |
+| fragment_count | u64 | Total semua fragmen |
+| gc_min / gc_max | Option<f64> | Rentang GC yang dikonfigurasi |
+| max_homopolymer | Option<usize> | Batas run homopolymer |
+| created_at | Option<String> | Stempel waktu pembuatan (detik Unix) |
+
+### 16.7 Metrik dan rumus
+
+Throughput per tahap:
+
+```
+throughput_MiB_s = bytes_processed / (elapsed_ms / 1000) / (1024 * 1024)
+```
+
+Overhead penyimpanan:
+
+```
+overhead_percent = (encoded_bytes - original_bytes) / original_bytes * 100%
+```
+
+Basis per byte:
+
+```
+bases_per_byte = dna_bases / original_bytes
+```
+
+Recovery rate fragmen:
+
+```
+recovery_rate = fragments_recovered / fragments_total
+```
+
+Exact-file recovery: hash SHA-256 hasil pemulihan identik dengan hash berkas asli. Memori puncak (peak RSS) dibaca dari `/proc/self/status` field `VmHWM` (khusus Linux); `None` pada platform lain.
+
+### 16.8 Referensi lengkap opsi CLI
+
+#### `encode` (byte → DNA → arsip)
+
+| Opsi | Default | Keterangan |
+| --- | --- | --- |
+| INPUT | — | Berkas masukan |
+| OUTPUT | — | Direktori arsip tujuan |
+| `--fragment-size` | 1024 | Basis DNA per payload fragmen |
+| `--ecc-k` | 4 | Jumlah fragmen data (RS k) |
+| `--ecc-r` | 2 | Jumlah fragmen paritas / toleransi erasure |
+| `--strict` | (off) | Tolak jika pelanggaran batasan |
+| `--gc-min` | 0.3 | Fraksi GC minimum (0..=1) |
+| `--gc-max` | 0.7 | Fraksi GC maksimum (0..=1) |
+| `--max-homopolymer` | 5 | Panjang run homopolymer maksimum |
+
+#### `decode` (arsip → byte)
+
+| Opsi | Default | Keterangan |
+| --- | --- | --- |
+| INPUT | — | Direktori arsip |
+| OUTPUT | — | Berkas keluaran byte |
+
+#### `validate` (struktur & integritas)
+
+| Opsi | Default | Keterangan |
+| --- | --- | --- |
+| INPUT | — | Direktori arsip |
+
+Keluar dengan kode 2 jika ada blok korup/hilang atau pelanggaran batasan.
+
+#### `simulate` (kesalahan kanal)
+
+| Opsi | Default | Keterangan |
+| --- | --- | --- |
+| INPUT | — | Direktori arsip sumber |
+| OUTPUT | — | Direktori arsip korup tujuan |
+| `--sub` | 0.0 | Tingkat substitusi per basis (0..=1) |
+| `--ins` | 0.0 | Tingkat inserti per basis (0..=1) |
+| `--del` | 0.0 | Tingkat deleti per basis (0..=1) |
+| `--dropout` | 0.0 | Tingkat dropout per fragmen (0..=1) |
+| `--dup` | 0.0 | Tingkat duplikasi per fragmen (0..=1) |
+| `--seed` | 0 | Seed PRNG (deterministik) |
+
+#### `recover` (pemulihan data)
+
+| Opsi | Default | Keterangan |
+| --- | --- | --- |
+| INPUT | — | Direktori arsip (mungkin korup) |
+| OUTPUT | — | Berkas keluaran byte |
+| `--original` | — | Berkas asli untuk verifikasi hash |
+
+Keluar dengan kode 3 jika hash tidak cocok.
+
+#### `benchmark` (ukuran & laporan)
+
+| Opsi | Default | Keterangan |
+| --- | --- | --- |
+| INPUT | — | Berkas masukan |
+| `--report` | — | Jalur laporan (`.csv` atau `.json`) |
+| `--sizes` | `1KiB,64KiB,1MiB` | Daftar ukuran input (KiB/MiB/GiB) |
+| `--seeds` | `1,2,3` | Daftar seed acak |
+| `--ecc-k` | 4 | RS data fragments |
+| `--ecc-r` | 2 | RS parity fragments |
+| `--fragment-size` | 1024 | Basis per fragmen |
+| `--sub/--ins/--del` | 0.0 | Tingkat kesalahan kanal |
+| `--dropout/--dup` | 0.0 | Tingkat dropout/duplikasi |
+| `--seed` | 0 | Seed dasar |
+
+#### `inspect` (tampilkan manifest)
+
+| Opsi | Default | Keterangan |
+| --- | --- | --- |
+| INPUT | — | Direktori arsip |
+
+Gunakan `dnaforge --help` dan `dnaforge <perintah> --help` untuk detail terkini.
+
+### 16.9 Hierarki penanganan kesalahan
+
+* `PipelineError` — Io, Storage, Format, Codec, Channel, Recovery, Ecc, Config, ConstraintViolations, HashMismatch, TooManyErasures.
+* `RecoveryError` — NotEnoughDataBlocks, TooManyErasures, BlockCountMismatch, BlockSizeMismatch, Ecc, Format, Codec, HashMismatch, Io.
+* `ChannelError` — InvalidRate.
+* `FormatError` — BadMagic, UnsupportedVersion, BlockSizeMismatch, PayloadTooLarge, PayloadHashMismatch, Hash, Io.
+* `ReedSolomonError` — TooFewErasureSymbols, BlockCountMismatch, BlockSizeMismatch, TooManyFragments.
+* `StorageError` — Io, Manifest, Format, BlockSizeMismatch.
+
+Semua tipe mengimplementasi `std::error::Error` dan banyak sekali menyediakan `From` untuk komposisi kesalahan antar-modul.
+
+### 16.10 Batasan versi dan kompatibilitas
+
+* Versi format fragmen saat ini: `1` (`FRAGMENT_FORMAT_VERSION`). Tambahkan versi saat tata letak biner berubah.
+* `n = k + r` tidak boleh melebihi 255 (batas GF(256)).
+* Payload blok di-pad ke kelipatan 16 byte; fragmen terakhir dapat lebih pendek dan di-pad dengan nol.
+* `data_index` tidak disimpan dalam tata letak blok; pulih dari urutan arsip oleh lapisan arsip.
+* Codec dua bit adalah baseline komputasi; belum siap sintesis biologis tanpa pertimbangan GC, homopolymer, distribusi basis, dan batasan panjang urutan.
+
+## 17. Lisensi
+
+Disenjakan di bawah [MIT OR Apache-2.0](LICENSE).

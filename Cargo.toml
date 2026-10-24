@@ -1,0 +1,30 @@
+[package]
+name = "dnaforge"
+version = "0.1.0"
+edition = "2024"
+description = "Computational DNA data storage baseline: codec, channel simulation, erasure-coded fragments, recovery, CLI, benchmarks."
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rand = "0.8"
+
+[dev-dependencies]
+proptest = "1"
+criterion = "0.5"
+
+[[bin]]
+name = "dnaforge"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+
+[workspace]

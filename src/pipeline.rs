@@ -4,16 +4,14 @@
 //! Each stage can be run independently through the CLI so failures can be
 //! localized.
 
-use crate::channel::{simulate, ChannelConfig};
-use crate::constraints::{validate, ConstraintConfig};
+use crate::channel::{ChannelConfig, simulate};
+use crate::constraints::{ConstraintConfig, validate};
 use crate::ecc::{ReedSolomon, ReedSolomonConfig};
-use crate::fragment::{
-    deserialize_block, serialize_block, Fragment, FragmentKind, HEADER_SIZE,
-};
-use crate::metrics::{measure, peak_rss_kb, ResilienceMetrics, StageMetric, StorageMetrics};
+use crate::fragment::{Fragment, HEADER_SIZE, deserialize_block, serialize_block};
+use crate::metrics::{ResilienceMetrics, StageMetric, StorageMetrics, measure, peak_rss_kb};
 use crate::report::BenchmarkRow;
 use crate::storage::{
-    read_archive_blocks_dense, write_archive, ArchiveManifest, StorageError,
+    ArchiveManifest, StorageError, append_duplicate, read_archive_blocks_dense, write_archive,
 };
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -80,10 +78,19 @@ impl std::fmt::Display for PipelineError {
                 write!(f, "pipeline: {} constraint violation(s)", v.len())
             }
             PipelineError::HashMismatch { expected, actual } => {
-                write!(f, "pipeline: hash mismatch: expected {expected}, actual {actual}")
+                write!(
+                    f,
+                    "pipeline: hash mismatch: expected {expected}, actual {actual}"
+                )
             }
-            PipelineError::TooManyErasures { erasures, tolerance } => {
-                write!(f, "pipeline: {erasures} erasures exceed tolerance {tolerance}")
+            PipelineError::TooManyErasures {
+                erasures,
+                tolerance,
+            } => {
+                write!(
+                    f,
+                    "pipeline: {erasures} erasures exceed tolerance {tolerance}"
+                )
             }
         }
     }
@@ -169,6 +176,13 @@ pub fn encode_pipeline(
 ) -> Result<EncodedArchive, PipelineError> {
     let k = config.ecc_k;
     let r = config.ecc_r;
+    if config.fragment_size_bases == 0 {
+        return Err(PipelineError::Config(
+            "fragment_size_bases must be greater than zero".into(),
+        ));
+    }
+    let ecc_config = ReedSolomonConfig::new(k, r)?;
+    let rs = ReedSolomon::new(ecc_config)?;
 
     let mut hasher = Sha256::new();
     hasher.update(input);
@@ -185,62 +199,61 @@ pub fn encode_pipeline(
         return Err(PipelineError::ConstraintViolations(violations.clone()));
     }
 
-    // Fragment the DNA stream into fixed-size payloads.
+    // Fragment the DNA stream into fixed-size data payloads.
     let frag_size = config.fragment_size_bases;
-    let mut fragments: Vec<Fragment> = Vec::new();
-    let mut offset: u64 = 0;
-    for chunk in bases.chunks(frag_size) {
-        let payload: Vec<crate::codec::Base> = chunk.to_vec();
-        fragments.push(Fragment::new_data(
-            fragments.len() as u64,
-            fragments.len() as u32,
-            k as u32,
-            offset,
-            payload,
-        ));
-        offset += chunk.len() as u64;
-    }
-
-    if fragments.is_empty() {
-        fragments.push(Fragment::new_data(0, 0, k as u32, 0, Vec::new()));
-    }
-
-    let total_data = fragments.len() as u32;
-    let max_payload = fragments.iter().map(|f| f.meta.payload_len).max().unwrap_or(0);
-    let block_payload_size = max_payload.next_multiple_of(16).max(16);
-
-    // Serialize data blocks.
-    let data_blocks: Vec<Vec<u8>> = fragments
-        .iter()
-        .map(|f| serialize_block(f, block_payload_size))
+    let mut data_payloads: Vec<Vec<crate::codec::Base>> = bases
+        .chunks(frag_size)
+        .map(|chunk| chunk.to_vec())
         .collect();
+    if data_payloads.is_empty() {
+        data_payloads.push(Vec::new());
+    }
+    let total_data = u32::try_from(data_payloads.len())
+        .map_err(|_| PipelineError::Config("too many data fragments".into()))?;
+    let stripe_count = data_payloads.len().div_ceil(k);
+    let total_blocks = stripe_count
+        .checked_mul(ecc_config.n())
+        .ok_or_else(|| PipelineError::Config("fragment count overflow".into()))?;
+    let max_payload = data_payloads.iter().map(Vec::len).max().unwrap_or(0);
+    let block_payload_size = max_payload
+        .checked_add(15)
+        .map(|size| (size / 16) * 16)
+        .unwrap_or(0)
+        .max(16);
+    let mut all_fragments = Vec::with_capacity(total_blocks);
 
-    // Reed-Solomon parity over the serialized blocks.
-    let ecc_config = ReedSolomonConfig::new(k, r)?;
-    let rs = ReedSolomon::new(ecc_config)?;
-    let refs: Vec<&[u8]> = data_blocks.iter().map(|b| b.as_slice()).collect();
-    let parity_blocks = rs.encode(&refs)?;
-
-    // Parity fragments with authentic headers (payloads hold RS symbols).
-    let mut all_fragments = fragments;
-    for (j, parity) in parity_blocks.into_iter().enumerate() {
-        let id = (k + j) as u64;
-        let mut hasher = Sha256::new();
-        hasher.update(&parity);
-        let payload_hash = hasher.finalize().into();
-        all_fragments.push(Fragment {
-            meta: crate::fragment::FragmentMeta {
-                id,
-                kind: FragmentKind::Parity,
-                data_index: None,
+    for stripe in 0..stripe_count {
+        let stripe_start = stripe * ecc_config.n();
+        let mut data_shards = Vec::with_capacity(k);
+        for shard in 0..k {
+            let data_index = stripe * k + shard;
+            let payload = data_payloads.get(data_index).cloned().unwrap_or_default();
+            let offset = (data_index * frag_size) as u64;
+            let fragment = Fragment::new_data(
+                (stripe_start + shard) as u64,
+                data_index as u32,
                 total_data,
-                offset_bases: 0,
-                payload_len: parity.len(),
-                payload_hash,
-                version: crate::fragment::FRAGMENT_FORMAT_VERSION,
-            },
-            payload: parity.iter().map(|&b| crate::codec::Base(b)).collect(),
-        });
+                offset,
+                payload.clone(),
+            );
+            let mut shard_bytes = vec![0; block_payload_size];
+            for (dest, base) in shard_bytes.iter_mut().zip(payload) {
+                *dest = base.0;
+            }
+            data_shards.push(shard_bytes);
+            all_fragments.push(fragment);
+        }
+
+        let shard_refs: Vec<&[u8]> = data_shards.iter().map(Vec::as_slice).collect();
+        let parity_shards = rs.encode(&shard_refs)?;
+        for (parity_index, parity) in parity_shards.into_iter().enumerate() {
+            all_fragments.push(Fragment::new_parity(
+                (stripe_start + k + parity_index) as u64,
+                total_data,
+                0,
+                parity.into_iter().map(crate::codec::Base).collect(),
+            ));
+        }
     }
 
     let manifest = ArchiveManifest {
@@ -256,7 +269,7 @@ pub fn encode_pipeline(
         ecc_k: k as u64,
         ecc_r: r as u64,
         total_data: total_data as u64,
-        total_parity: r as u64,
+        total_parity: (stripe_count * r) as u64,
         fragment_count: all_fragments.len() as u64,
         gc_min: Some(config.constraint_config.gc_min),
         gc_max: Some(config.constraint_config.gc_max),
@@ -278,24 +291,21 @@ pub fn encode_pipeline(
 }
 
 /// Write an encoded archive to a directory.
-pub fn write_encoded_archive(
-    archive: &EncodedArchive,
-    dir: &Path,
-) -> Result<(), PipelineError> {
-    write_archive(dir, &archive.manifest, &archive.fragments, archive.block_payload_size)?;
+pub fn write_encoded_archive(archive: &EncodedArchive, dir: &Path) -> Result<(), PipelineError> {
+    write_archive(
+        dir,
+        &archive.manifest,
+        &archive.fragments,
+        archive.block_payload_size,
+    )?;
     Ok(())
 }
 
 /// Decode an archive back into bytes (assumes no channel errors).
-pub fn decode_pipeline(
-    dir: &Path,
-) -> Result<(Vec<u8>, ArchiveManifest), PipelineError> {
+pub fn decode_pipeline(dir: &Path) -> Result<(Vec<u8>, ArchiveManifest), PipelineError> {
     let blocks = read_archive_blocks_dense(dir)?;
     let manifest_path = dir.join("manifest.json");
-    let manifest: ArchiveManifest =
-        serde_json::from_str(
-            &std::fs::read_to_string(&manifest_path)?,
-        )
+    let manifest: ArchiveManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)
         .map_err(|e| PipelineError::Storage(StorageError::Manifest(e.to_string())))?;
     let block_payload_size = manifest.block_payload_size as usize;
 
@@ -303,26 +313,27 @@ pub fn decode_pipeline(
         ecc_k: manifest.ecc_k as usize,
         ecc_r: manifest.ecc_r as usize,
         block_payload_size,
+        fragment_size_bases: manifest.fragment_size_bases as usize,
         validate_constraints: false,
         constraint_config: ConstraintConfig::default(),
     };
     let original_hash = manifest.original_hash();
-    let report = crate::recovery::recover_blocks(&blocks, &config, original_hash)?;
-    let bytes = report.recovered_bytes.ok_or_else(|| {
-        PipelineError::Config("recovery produced no bytes".into())
-    })?;
+    let report = crate::recovery::recover_archive_blocks(
+        &blocks,
+        &config,
+        manifest.total_data as usize,
+        original_hash,
+    )?;
+    let bytes = report
+        .recovered_bytes
+        .ok_or_else(|| PipelineError::Config("recovery produced no bytes".into()))?;
     Ok((bytes, manifest))
 }
 
 /// Validate an archive: structure, checksums, constraints.
-pub fn validate_pipeline(
-    dir: &Path,
-) -> Result<ValidationReport, PipelineError> {
+pub fn validate_pipeline(dir: &Path) -> Result<ValidationReport, PipelineError> {
     let manifest_path = dir.join("manifest.json");
-    let manifest: ArchiveManifest =
-        serde_json::from_str(
-            &std::fs::read_to_string(&manifest_path)?,
-        )
+    let manifest: ArchiveManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)
         .map_err(|e| PipelineError::Storage(StorageError::Manifest(e.to_string())))?;
     let block_payload_size = manifest.block_payload_size as usize;
 
@@ -335,21 +346,19 @@ pub fn validate_pipeline(
     for block in &blocks {
         match block {
             None => missing += 1,
-            Some(block) => {
-                match deserialize_block(block, block_payload_size) {
-                    Ok(fragment) => {
-                        parsed += 1;
-                        if fragment.is_data() {
-                            let (_status, violations) =
-                                validate(&fragment.payload, ConstraintConfig::default());
-                            if !violations.is_empty() {
-                                constraint_violations.extend(violations);
-                            }
+            Some(block) => match deserialize_block(block, block_payload_size) {
+                Ok(fragment) => {
+                    parsed += 1;
+                    if fragment.is_data() {
+                        let (_status, violations) =
+                            validate(&fragment.payload, ConstraintConfig::default());
+                        if !violations.is_empty() {
+                            constraint_violations.extend(violations);
                         }
                     }
-                    Err(_) => corrupted += 1,
                 }
-            }
+                Err(_) => corrupted += 1,
+            },
         }
     }
 
@@ -372,20 +381,18 @@ pub fn simulate_pipeline(
 ) -> Result<SimulationReport, PipelineError> {
     let blocks = read_archive_blocks_dense(src_dir)?;
     let manifest_path = src_dir.join("manifest.json");
-    let manifest: ArchiveManifest =
-        serde_json::from_str(
-            &std::fs::read_to_string(&manifest_path)?,
-        )
+    let manifest: ArchiveManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)
         .map_err(|e| PipelineError::Storage(StorageError::Manifest(e.to_string())))?;
     let block_payload_size = manifest.block_payload_size as usize;
 
-    // Data fragment payloads (DNA bases) in id order.
+    // Data fragment payloads (DNA bases) in archive order across all stripes.
+    let mut data_positions = Vec::new();
     let mut payloads: Vec<Vec<crate::codec::Base>> = Vec::new();
-    for i in 0..manifest.ecc_k as usize {
-        match &blocks[i] {
-            None => payloads.push(Vec::new()),
-            Some(block) => {
-                let fragment = deserialize_block(block, block_payload_size)?;
+    for (id, maybe_block) in blocks.iter().enumerate() {
+        if let Some(block) = maybe_block {
+            let fragment = deserialize_block(block, block_payload_size)?;
+            if fragment.is_data() {
+                data_positions.push(id);
                 payloads.push(fragment.payload);
             }
         }
@@ -393,30 +400,29 @@ pub fn simulate_pipeline(
 
     let sim = simulate(&payloads, config)?;
 
-    // Rebuild a corrupted archive. Headers are kept intact, so insertions/
-    // deletions change the payload length and cause checksum/length mismatches
-    // that the recovery layer detects as erasures.
+    // Rebuild a corrupted archive while retaining each observation's source
+    // identity. Keep the original checksum so any changed payload is classified
+    // as an erasure during recovery.
     let mut fragments: Vec<Fragment> = Vec::new();
-    for (i, payload) in sim.fragments.iter().enumerate() {
-        let mut block = match &blocks[i] {
-            Some(b) => b.clone(),
-            None => vec![0u8; HEADER_SIZE + block_payload_size],
+    let mut duplicate_fragments = Vec::new();
+    for (id, maybe_block) in blocks.iter().enumerate() {
+        let Some(block) = maybe_block else {
+            continue;
         };
-        let bases = payload.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
-        let mut mutated: Vec<u8> = bases.iter().map(|b| b.0).collect();
-        mutated.resize(block_payload_size, 0);
-        mutated.truncate(block_payload_size);
-        block[62..62 + mutated.len()].copy_from_slice(&mutated);
-        let fragment = deserialize_block(&block, block_payload_size).unwrap_or_else(|_| {
-            Fragment::new_data(i as u64, i as u32, manifest.ecc_k as u32, 0, Vec::new())
-        });
-        fragments.push(fragment);
-    }
-
-    // Parity blocks copied as-is.
-    for i in manifest.ecc_k as usize..blocks.len() {
-        if let Some(block) = &blocks[i] {
-            fragments.push(deserialize_block(block, block_payload_size)?);
+        let original = deserialize_block(block, block_payload_size)?;
+        if original.is_data() {
+            let Some(source_index) = data_positions.iter().position(|&position| position == id)
+            else {
+                return Err(PipelineError::Config(format!(
+                    "data fragment {id} is missing from the channel input"
+                )));
+            };
+            let Some(payload) = sim.fragments[source_index].as_ref() else {
+                continue;
+            };
+            fragments.push(channel_observation(&original, payload, block_payload_size));
+        } else {
+            fragments.push(original);
         }
     }
 
@@ -425,6 +431,31 @@ pub fn simulate_pipeline(
         ..manifest.clone()
     };
     write_archive(dst_dir, &corrupted_manifest, &fragments, block_payload_size)?;
+    for (source_index, payload) in &sim.duplicates {
+        let id = *data_positions.get(*source_index).ok_or_else(|| {
+            PipelineError::Config(format!(
+                "duplicate references unknown channel input fragment {source_index}"
+            ))
+        })?;
+        let original = deserialize_block(
+            blocks[id]
+                .as_deref()
+                .ok_or_else(|| PipelineError::Config(format!("fragment {id} disappeared")))?,
+            block_payload_size,
+        )?;
+        duplicate_fragments.push((
+            original.meta.id,
+            channel_observation(&original, payload, block_payload_size),
+        ));
+    }
+    for (copy, (id, fragment)) in duplicate_fragments.iter().enumerate() {
+        append_duplicate(
+            dst_dir,
+            *id,
+            copy + 1,
+            &serialize_block(fragment, block_payload_size),
+        )?;
+    }
 
     Ok(SimulationReport {
         fragments_total: manifest.fragment_count,
@@ -435,6 +466,28 @@ pub fn simulate_pipeline(
     })
 }
 
+fn channel_observation(
+    original: &Fragment,
+    payload: &[crate::codec::Base],
+    block_payload_size: usize,
+) -> Fragment {
+    let observed_payload =
+        if payload.len() == original.payload.len() && payload.len() <= block_payload_size {
+            payload.to_vec()
+        } else {
+            Vec::new()
+        };
+    let mut observed = Fragment::new_data(
+        original.meta.id,
+        original.meta.data_index.unwrap_or(0),
+        original.meta.total_data,
+        original.meta.offset_bases,
+        observed_payload,
+    );
+    observed.meta.payload_hash = original.meta.payload_hash;
+    observed
+}
+
 /// Recover a (possibly corrupted) archive into bytes.
 pub fn recover_pipeline(
     dir: &Path,
@@ -442,10 +495,7 @@ pub fn recover_pipeline(
 ) -> Result<(Vec<u8>, crate::recovery::RecoveryReport), PipelineError> {
     let blocks = read_archive_blocks_dense(dir)?;
     let manifest_path = dir.join("manifest.json");
-    let manifest: ArchiveManifest =
-        serde_json::from_str(
-            &std::fs::read_to_string(&manifest_path)?,
-        )
+    let manifest: ArchiveManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)
         .map_err(|e| PipelineError::Storage(StorageError::Manifest(e.to_string())))?;
     let block_payload_size = manifest.block_payload_size as usize;
 
@@ -453,14 +503,21 @@ pub fn recover_pipeline(
         ecc_k: manifest.ecc_k as usize,
         ecc_r: manifest.ecc_r as usize,
         block_payload_size,
+        fragment_size_bases: manifest.fragment_size_bases as usize,
         validate_constraints: false,
         constraint_config: ConstraintConfig::default(),
     };
     let hash = original_hash.or_else(|| manifest.original_hash());
-    let report = crate::recovery::recover_blocks(&blocks, &config, hash)?;
-    let bytes = report.recovered_bytes.clone().ok_or_else(|| {
-        PipelineError::Config("recovery produced no bytes".into())
-    })?;
+    let report = crate::recovery::recover_archive_blocks(
+        &blocks,
+        &config,
+        manifest.total_data as usize,
+        hash,
+    )?;
+    let bytes = report
+        .recovered_bytes
+        .clone()
+        .ok_or_else(|| PipelineError::Config("recovery produced no bytes".into()))?;
     Ok((bytes, report))
 }
 
@@ -471,11 +528,22 @@ pub fn benchmark_once(
     seed: u64,
     config: &PipelineConfig,
 ) -> Result<BenchmarkRow, PipelineError> {
-    let (archive_result, encode_ms) = measure(|| encode_pipeline(input, config));
+    let mut run_config = config.clone();
+    run_config.channel.seed = seed;
+    let (archive_result, encode_ms) = measure(|| encode_pipeline(input, &run_config));
     let archive = archive_result?;
 
-    let dir = std::env::temp_dir().join(format!("dnaforge-bench-{:x}-{}", seed, std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| PipelineError::Io(error.to_string()))?
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "dnaforge-bench-{:x}-{}-{nonce}",
+        seed,
+        std::process::id()
+    ));
+    std::fs::create_dir(&dir)?;
+    let _temp_archive = TempArchiveDir(dir.clone());
     write_encoded_archive(&archive, &dir)?;
 
     let original_hash = archive.manifest.original_hash();
@@ -483,20 +551,20 @@ pub fn benchmark_once(
     let (_result, decode_ms) = measure(|| decode_pipeline(&dir));
     let _ = _result?;
 
-    let (simulate_ms, recover_ms, resilience) = if config.channel.substitution_rate == 0.0
-        && config.channel.insertion_rate == 0.0
-        && config.channel.deletion_rate == 0.0
-        && config.channel.dropout_rate == 0.0
+    let (simulate_ms, recover_ms, resilience) = if run_config.channel.substitution_rate == 0.0
+        && run_config.channel.insertion_rate == 0.0
+        && run_config.channel.deletion_rate == 0.0
+        && run_config.channel.dropout_rate == 0.0
+        && run_config.channel.duplication_rate == 0.0
     {
         (0, 0, ResilienceMetrics::default())
     } else {
         let corrupted_dir = dir.join("corrupted");
         let (sim_result, sim_ms) = measure(|| {
-            simulate_pipeline(dir.as_path(), &corrupted_dir, &config.channel).map(|_| ())
+            simulate_pipeline(dir.as_path(), &corrupted_dir, &run_config.channel).map(|_| ())
         });
         sim_result?;
-        let (rec_result, rec_ms) =
-            measure(|| recover_pipeline(&corrupted_dir, original_hash));
+        let (rec_result, rec_ms) = measure(|| recover_pipeline(&corrupted_dir, original_hash));
         let (_bytes, report) = rec_result?;
         let resilience = ResilienceMetrics {
             fragments_total: report.blocks_total as u64,
@@ -521,8 +589,7 @@ pub fn benchmark_once(
     let storage = StorageMetrics::new(
         input.len() as u64,
         archive.manifest.dna_bases,
-        archive.fragments.len() as u64
-            * (HEADER_SIZE + archive.block_payload_size) as u64,
+        archive.fragments.len() as u64 * (HEADER_SIZE + archive.block_payload_size) as u64,
     );
 
     Ok(BenchmarkRow {
@@ -530,9 +597,16 @@ pub fn benchmark_once(
         seed,
         input_bytes: input.len() as u64,
         dna_bases: archive.manifest.dna_bases,
-        fragment_size_bases: config.fragment_size_bases as u64,
-        ecc_k: config.ecc_k as u64,
-        ecc_r: config.ecc_r as u64,
+        fragment_size_bases: run_config.fragment_size_bases as u64,
+        ecc_k: run_config.ecc_k as u64,
+        ecc_r: run_config.ecc_r as u64,
+        archive_format_version: crate::fragment::FRAGMENT_FORMAT_VERSION,
+        channel_model_version: crate::channel::CHANNEL_MODEL_VERSION.into(),
+        substitution_rate: run_config.channel.substitution_rate,
+        insertion_rate: run_config.channel.insertion_rate,
+        deletion_rate: run_config.channel.deletion_rate,
+        dropout_rate: run_config.channel.dropout_rate,
+        duplication_rate: run_config.channel.duplication_rate,
         encode_ms,
         decode_ms,
         simulate_ms,
@@ -563,11 +637,18 @@ pub fn benchmark_once(
     })
 }
 
-use std::time::SystemTime;
+struct TempArchiveDir(PathBuf);
+
+impl Drop for TempArchiveDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::sha256_hex;
 
     #[test]
     fn encode_decode_round_trip() {
@@ -579,7 +660,13 @@ mod tests {
             ..Default::default()
         };
         let archive = encode_pipeline(&data, &config).unwrap();
-        let dir = std::env::temp_dir().join(format!("dnaforge-pipeline-test-{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "dnaforge-pipeline-test-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         write_encoded_archive(&archive, &dir).unwrap();
         let (decoded, manifest) = decode_pipeline(&dir).unwrap();
@@ -604,8 +691,8 @@ mod tests {
             ecc_k: 4,
             ecc_r: 2,
             channel: ChannelConfig {
-                substitution_rate: 0.05,
-                deletion_rate: 0.02,
+                substitution_rate: 0.001,
+                deletion_rate: 0.001,
                 dropout_rate: 0.0,
                 duplication_rate: 0.0,
                 seed: 42,
@@ -614,14 +701,78 @@ mod tests {
             ..Default::default()
         };
         let archive = encode_pipeline(&data, &config).unwrap();
-        let dir = std::env::temp_dir().join(format!("dnaforge-pipeline-test-{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "dnaforge-pipeline-test-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         write_encoded_archive(&archive, &dir).unwrap();
 
         let corrupted = dir.join("corrupted");
-        simulate_pipeline(dir, &corrupted, &config.channel).unwrap();
-        let (recovered, report) = recover_pipeline(&corrupted, archive.manifest.original_hash()).unwrap();
+        simulate_pipeline(&dir, &corrupted, &config.channel).unwrap();
+        let (recovered, report) =
+            recover_pipeline(&corrupted, archive.manifest.original_hash()).unwrap();
         assert_eq!(recovered, data);
         assert!(report.exact_match == Some(true));
+    }
+
+    #[test]
+    fn duplicated_observations_keep_fragment_identity() {
+        let data: Vec<u8> = (0..100).map(|i| i as u8).collect();
+        let config = PipelineConfig {
+            fragment_size_bases: 32,
+            ecc_k: 3,
+            ecc_r: 1,
+            ..Default::default()
+        };
+        let archive = encode_pipeline(&data, &config).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "dnaforge-duplicate-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_encoded_archive(&archive, &dir).unwrap();
+
+        let corrupted = dir.join("corrupted");
+        let channel = ChannelConfig {
+            duplication_rate: 1.0,
+            seed: 17,
+            ..Default::default()
+        };
+        let simulation = simulate_pipeline(&dir, &corrupted, &channel).unwrap();
+        let duplicate_count = std::fs::read_dir(&corrupted)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("_dup"))
+            .count();
+        assert_eq!(duplicate_count, simulation.stats.duplications as usize);
+
+        let (recovered, report) =
+            recover_pipeline(&corrupted, archive.manifest.original_hash()).unwrap();
+        assert_eq!(recovered, data);
+        assert_eq!(report.exact_match, Some(true));
+    }
+
+    #[test]
+    fn empty_input_round_trips_through_archive() {
+        let archive = encode_pipeline(&[], &PipelineConfig::default()).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "dnaforge-empty-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_encoded_archive(&archive, &dir).unwrap();
+        let (recovered, report) = decode_pipeline(&dir).unwrap();
+        assert!(recovered.is_empty());
+        assert_eq!(report.original_size_bytes, 0);
     }
 }

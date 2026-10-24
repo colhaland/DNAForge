@@ -12,13 +12,13 @@
 //!   report     - CSV/JSON experiment export
 //!   pipeline   - end-to-end orchestration
 
+pub mod channel;
 pub mod codec;
 pub mod constraints;
 pub mod ecc;
 pub mod fragment;
-pub mod channel;
-pub mod recovery;
 pub mod metrics;
-pub mod storage;
-pub mod report;
 pub mod pipeline;
+pub mod recovery;
+pub mod report;
+pub mod storage;

@@ -96,12 +96,7 @@ impl Fragment {
         }
     }
 
-    pub fn new_parity(
-        id: u64,
-        total_data: u32,
-        offset_bases: u64,
-        payload: Vec<Base>,
-    ) -> Self {
+    pub fn new_parity(id: u64, total_data: u32, offset_bases: u64, payload: Vec<Base>) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(payload_bytes(&payload));
         let payload_hash = hasher.finalize().into();
@@ -244,9 +239,18 @@ pub fn deserialize_block(block: &[u8], block_payload_size: usize) -> Result<Frag
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FormatError {
     BadMagic,
-    UnsupportedVersion { supported: u16, found: u16 },
-    BlockSizeMismatch { expected: usize, got: usize },
-    PayloadTooLarge { payload_len: usize, block_payload_size: usize },
+    UnsupportedVersion {
+        supported: u16,
+        found: u16,
+    },
+    BlockSizeMismatch {
+        expected: usize,
+        got: usize,
+    },
+    PayloadTooLarge {
+        payload_len: usize,
+        block_payload_size: usize,
+    },
     PayloadHashMismatch,
     /// Underlying checksum/hash failure.
     Hash(String),
@@ -258,12 +262,21 @@ impl std::fmt::Display for FormatError {
         match self {
             FormatError::BadMagic => write!(f, "format: bad magic bytes (not a DNAForge fragment)"),
             FormatError::UnsupportedVersion { supported, found } => {
-                write!(f, "format: unsupported version {found} (supported {supported})")
+                write!(
+                    f,
+                    "format: unsupported version {found} (supported {supported})"
+                )
             }
             FormatError::BlockSizeMismatch { expected, got } => {
-                write!(f, "format: block size mismatch: expected {expected}, got {got}")
+                write!(
+                    f,
+                    "format: block size mismatch: expected {expected}, got {got}"
+                )
             }
-            FormatError::PayloadTooLarge { payload_len, block_payload_size } => {
+            FormatError::PayloadTooLarge {
+                payload_len,
+                block_payload_size,
+            } => {
                 write!(
                     f,
                     "format: payload length {payload_len} exceeds block payload size {block_payload_size}"

@@ -6,7 +6,7 @@
 //! individually addressable and lets the channel simulator drop or duplicate
 //! files naturally.
 
-use crate::fragment::{deserialize_block, serialize_block, Fragment, HEADER_SIZE};
+use crate::fragment::{Fragment, HEADER_SIZE, deserialize_block, serialize_block};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -101,7 +101,6 @@ pub fn read_archive_blocks(dir: &Path) -> Result<BTreeMap<u64, Vec<u8>>, Storage
     let expected_size = HEADER_SIZE + block_payload_size;
 
     let mut blocks = BTreeMap::new();
-    let mut duplicates = 0u64;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -110,35 +109,47 @@ pub fn read_archive_blocks(dir: &Path) -> Result<BTreeMap<u64, Vec<u8>>, Storage
             continue;
         }
         // Parse id from frag_{id:06}.bin or frag_{id:06}_dupN.bin
-        let id_part = file_name.strip_prefix("frag_").unwrap_or(file_name);
+        let id_part = file_name
+            .strip_prefix("frag_")
+            .and_then(|name| name.strip_suffix(".bin"))
+            .unwrap_or("");
         let id_str = id_part.split('_').next().unwrap_or("");
         let id: u64 = match id_str.parse() {
             Ok(v) => v,
             Err(_) => continue,
         };
         if blocks.contains_key(&id) {
-            duplicates += 1;
             continue;
         }
         let data = std::fs::read(&path)?;
         if data.len() != expected_size {
-            return Err(StorageError::BlockSizeMismatch { expected: expected_size, got: data.len() });
+            return Err(StorageError::BlockSizeMismatch {
+                expected: expected_size,
+                got: data.len(),
+            });
         }
         blocks.insert(id, data);
     }
 
-    let n = blocks.len();
-    // Expect dense ids 0..n-1? Not necessarily after dropouts; caller handles.
-    let _ = manifest;
-    let _ = duplicates;
     Ok(blocks)
 }
 
 /// Read blocks into a dense vec indexed by id: `blocks[id]`, missing = None.
 pub fn read_archive_blocks_dense(dir: &Path) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
     let map = read_archive_blocks(dir)?;
-    let max_id = map.keys().copied().max().unwrap_or(0);
-    let mut blocks = vec![None; (max_id + 1) as usize];
+    let manifest_path = dir.join("manifest.json");
+    let manifest: ArchiveManifest = serde_json::from_str(
+        &std::fs::read_to_string(manifest_path).map_err(|e| StorageError::Io(e.to_string()))?,
+    )
+    .map_err(|e| StorageError::Manifest(e.to_string()))?;
+    let count = usize::try_from(manifest.fragment_count)
+        .map_err(|_| StorageError::Manifest("fragment_count exceeds platform limits".into()))?;
+    if map.keys().any(|id| *id >= manifest.fragment_count) {
+        return Err(StorageError::Manifest(
+            "fragment id is outside manifest fragment_count".into(),
+        ));
+    }
+    let mut blocks = vec![None; count];
     for (id, data) in map {
         blocks[id as usize] = Some(data);
     }
@@ -173,7 +184,10 @@ impl std::fmt::Display for StorageError {
             StorageError::Manifest(msg) => write!(f, "storage: manifest error: {msg}"),
             StorageError::Format(msg) => write!(f, "storage: format error: {msg}"),
             StorageError::BlockSizeMismatch { expected, got } => {
-                write!(f, "storage: block size mismatch: expected {expected}, got {got}")
+                write!(
+                    f,
+                    "storage: block size mismatch: expected {expected}, got {got}"
+                )
             }
         }
     }
@@ -228,12 +242,18 @@ pub fn parse_archive_fragments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::encode_bytes;
+    use crate::codec::Base;
     use crate::fragment::Fragment;
     use std::collections::BTreeMap;
 
     fn tmp_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("dnaforge-test-{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
+        std::env::temp_dir().join(format!(
+            "dnaforge-test-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     #[test]
@@ -261,7 +281,7 @@ mod tests {
             max_homopolymer: None,
             created_at: None,
         };
-        write_archive(&dir, &manifest, &fragment, 16).unwrap();
+        write_archive(&dir, &manifest, &[fragment], 16).unwrap();
         let blocks = read_archive_blocks(&dir).unwrap();
         assert_eq!(blocks.len(), 1);
         let block = blocks.get(&0).unwrap();
@@ -273,7 +293,10 @@ mod tests {
     #[test]
     fn sha256_hex_known() {
         let digest = sha256_hex(b"");
-        assert_eq!(digest, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            digest,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]

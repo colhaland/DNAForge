@@ -4,6 +4,8 @@ Rencana ini mengurutkan pekerjaan untuk memenuhi [spesifikasi baseline](baseline
 
 ## Fase 0: Pulihkan gerbang build
 
+**Status terkini: selesai.** Unit test dan CLI integration test berjalan, warning Rust ditangani, serta workflow CI mencakup format, Clippy, dan test pada Linux, macOS, serta Windows.
+
 **Cakupan:** GAP-001, GAP-011; test compilation, format, warning baseline, CI.
 
 **Pekerjaan:** betulkan import/helper test; jalankan `cargo test`; tambahkan workflow CI untuk format, Clippy, dan test; tentukan apakah warning ditangani atau lint terpilih dikecualikan dengan alasan.
@@ -11,6 +13,8 @@ Rencana ini mengurutkan pekerjaan untuk memenuhi [spesifikasi baseline](baseline
 **Selesai bila:** test dapat dikompilasi dan berjalan; CI memberikan hasil reproduktif untuk pull request; tidak ada test dimatikan hanya untuk membuat gate hijau.
 
 ## Fase 1: Tetapkan kontrak arsip stabil
+
+**Status terkini: belum selesai.** Format v1 tetap eksperimental; perubahan kode saat ini tidak mengklaim kompatibilitas stabil.
 
 **Cakupan:** FR-015, FR-020..028, TST-003, TST-007; GAP-004, GAP-005, GAP-010.
 
@@ -20,6 +24,8 @@ Rencana ini mengurutkan pekerjaan untuk memenuhi [spesifikasi baseline](baseline
 
 ## Fase 2: Multi-stripe ECC dan pemulihan
 
+**Status terkini: pipeline stripe v1 diimplementasikan dan dites.** Versi format baru, parser ketat, fixture golden, dan validasi batas tetap wajib sebelum penutupan fase.
+
 **Cakupan:** FR-010..015, FR-022..026, TST-004, TST-005, TST-007; GAP-002.
 
 **Pekerjaan:** bentuk shard per stripe, encoding parity, padding yang tidak masuk output, deteksi erasure per stripe, validasi ulang hasil, reassembly berurutan, exact hash.
@@ -27,6 +33,8 @@ Rencana ini mengurutkan pekerjaan untuk memenuhi [spesifikasi baseline](baseline
 **Selesai bila:** berkas kosong, batas shard, beberapa stripe, stripe terakhir parsial, kombinasi erasure sampai `r`, serta `r+1` erasure menghasilkan hasil/error yang ditetapkan.
 
 ## Fase 3: Simulasi kanal yang menjaga identitas
+
+**Status terkini: indeks sumber, checksum, dropout, dan duplikasi ditangani pada pipeline; konflik antar-salinan dan metadata event yang tersimpan masih perlu diselesaikan.**
 
 **Cakupan:** FR-030..034, TST-006; GAP-003.
 
@@ -36,6 +44,8 @@ Rencana ini mengurutkan pekerjaan untuk memenuhi [spesifikasi baseline](baseline
 
 ## Fase 4: CLI dan pelaporan yang dapat dipercaya
 
+**Status terkini: sintaks command konsisten, benchmark memakai file input secara default, synthetic eksplisit, seed per-run, schema JSON, dan CSV escaping tersedia. Presisi metrik serta kelengkapan metadata belum selesai.**
+
 **Cakupan:** FR-040..044, TST-008; GAP-006..009.
 
 **Pekerjaan:** konsistenkan opsi input/output; tambahkan validasi parse; bedakan benchmark file aktual dari generator sintetis; gunakan seed yang tercatat untuk tiap run; serialisasi CSV/JSON dengan benar; tambahkan metadata lingkungan dan definisi metrik.
@@ -44,6 +54,8 @@ Rencana ini mengurutkan pekerjaan untuk memenuhi [spesifikasi baseline](baseline
 
 ## Fase 5: Constraint dan validasi domain
 
+**Status terkini: belum selesai.** Validasi arsip belum sepenuhnya memakai constraint tersimpan dan belum ada konfigurasi invalid yang divalidasi terpusat.
+
 **Cakupan:** FR-005..007, FR-027, TST-002.
 
 **Pekerjaan:** validasi nilai konfigurasi; gunakan konfigurasi manifest/override yang terdokumentasi; bedakan report dan strict rejection; tidak mengklaim sequence repair kecuali algoritma dan bukti ditambahkan sebagai fitur tersendiri.
@@ -51,6 +63,8 @@ Rencana ini mengurutkan pekerjaan untuk memenuhi [spesifikasi baseline](baseline
 **Selesai bila:** boundary tests lulus; encode dan validate memberikan temuan konsisten; tidak ada perubahan urutan diam-diam.
 
 ## Fase 6: Baseline performa dan eksperimen
+
+**Status terkini: benchmark Criterion codec tersedia; benchmark stage end-to-end dan statistik raw sample belum selesai.**
 
 **Cakupan:** bagian metrik dan NFR; GAP-011.
 

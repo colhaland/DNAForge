@@ -21,8 +21,6 @@
 //! fragment, substitutions/indels are detected by SHA-256 (see
 //! [`crate::recovery`]) and then treated as erasures.
 
-use std::cmp;
-
 /// GF(256) exponent and log tables for primitive polynomial 0x11d, generator 2.
 struct GfTables {
     exp: [u8; 512],
@@ -66,23 +64,6 @@ impl GfTables {
         }
         self.exp[((self.log[a as usize] + 255 - self.log[b as usize]) % 255) as usize]
     }
-
-    fn pow(&self, a: u8, e: u32) -> u8 {
-        if a == 0 {
-            return if e == 0 { 1 } else { 0 };
-        }
-        if e == 0 {
-            return 1;
-        }
-        self.exp[((self.log[a as usize] as u64 * e as u64) % 255) as usize]
-    }
-
-    fn inverse(&self, a: u8) -> u8 {
-        if a == 0 {
-            panic!("gf: inverse of zero");
-        }
-        self.exp[(255 - self.log[a as usize]) as usize]
-    }
 }
 
 static TABLES: std::sync::LazyLock<GfTables> = std::sync::LazyLock::new(GfTables::new);
@@ -93,14 +74,6 @@ fn gf_mul(a: u8, b: u8) -> u8 {
 
 fn gf_div(a: u8, b: u8) -> u8 {
     TABLES.div(a, b)
-}
-
-fn gf_pow(a: u8, e: u32) -> u8 {
-    TABLES.pow(a, e)
-}
-
-fn gf_inverse(a: u8) -> u8 {
-    TABLES.inverse(a)
 }
 
 /// Alpha^j (generator to the j-th power), j in 0..254.
@@ -125,7 +98,10 @@ impl std::fmt::Display for ReedSolomonError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReedSolomonError::TooFewErasureSymbols { have, need } => {
-                write!(f, "reed-solomon: only {have} symbols known, {need} required")
+                write!(
+                    f,
+                    "reed-solomon: only {have} symbols known, {need} required"
+                )
             }
             ReedSolomonError::BlockCountMismatch { expected, got } => {
                 write!(f, "reed-solomon: expected {expected} blocks, got {got}")
@@ -134,7 +110,11 @@ impl std::fmt::Display for ReedSolomonError {
                 write!(f, "reed-solomon: expected block size {expected}, got {got}")
             }
             ReedSolomonError::TooManyFragments { k, r } => {
-                write!(f, "reed-solomon: k + r = {} exceeds 255 GF(256) points", k + r)
+                write!(
+                    f,
+                    "reed-solomon: k + r = {} exceeds 255 GF(256) points",
+                    k + r
+                )
             }
         }
     }
@@ -153,11 +133,7 @@ pub struct ReedSolomonConfig {
 
 impl ReedSolomonConfig {
     pub fn new(k: usize, r: usize) -> Result<Self, ReedSolomonError> {
-        if k == 0 {
-            return Err(ReedSolomonError::TooManyFragments { k, r });
-        }
-        let n = k + r;
-        if n > 255 {
+        if k == 0 || k.checked_add(r).is_none_or(|n| n > 255) {
             return Err(ReedSolomonError::TooManyFragments { k, r });
         }
         Ok(Self { k, r })
@@ -187,11 +163,10 @@ impl ReedSolomon {
         }
 
         let k = config.k;
-        let r = config.r;
         // T[i][j] = L_i(alpha^(k+j)), L_i(x) = prod_{m != i} (x - alpha^m) / (alpha^i - alpha^m)
-        let mut t = vec![vec![0u8; r]; k];
-        for i in 0..k {
-            for j in 0..r {
+        let mut t = vec![vec![0u8; config.r]; k];
+        for (i, row) in t.iter_mut().enumerate() {
+            for (j, coefficient) in row.iter_mut().enumerate() {
                 let x = alpha_pow(k + j);
                 let mut num: u8 = 1;
                 let mut den: u8 = 1;
@@ -202,11 +177,15 @@ impl ReedSolomon {
                     num = gf_mul(num, gf_sub(x, alpha_pow(m)));
                     den = gf_mul(den, gf_sub(alpha_pow(i), alpha_pow(m)));
                 }
-                t[i][j] = gf_div(num, den);
+                *coefficient = gf_div(num, den);
             }
         }
 
-        Ok(Self { config, eval_points, t })
+        Ok(Self {
+            config,
+            eval_points,
+            t,
+        })
     }
 
     pub fn config(&self) -> ReedSolomonConfig {
@@ -222,25 +201,22 @@ impl ReedSolomon {
             });
         }
         let block_size = data[0].len();
-        for (i, block) in data.iter().enumerate() {
+        for block in data {
             if block.len() != block_size {
                 return Err(ReedSolomonError::BlockSizeMismatch {
                     expected: block_size,
                     got: block.len(),
                 });
             }
-            let _ = i;
         }
-        let k = self.config.k;
-        let r = self.config.r;
-        let mut parity = vec![vec![0u8; block_size]; r];
-        for b in 0..block_size {
-            for j in 0..r {
-                let mut acc: u8 = 0;
-                for i in 0..k {
-                    acc ^= gf_mul(data[i][b], self.t[i][j]);
-                }
-                parity[j][b] = acc;
+        let mut parity = vec![vec![0u8; block_size]; self.config.r];
+        for (b, _) in data[0].iter().enumerate() {
+            for (j, parity_block) in parity.iter_mut().enumerate() {
+                let acc = data
+                    .iter()
+                    .zip(&self.t)
+                    .fold(0, |acc, (block, coeffs)| acc ^ gf_mul(block[b], coeffs[j]));
+                parity_block[b] = acc;
             }
         }
         Ok(parity)
@@ -249,18 +225,15 @@ impl ReedSolomon {
     /// Reconstruct all n blocks from `blocks`, where `None` marks an erasure.
     /// Requires at least k known blocks. Returns the n recovered blocks in
     /// order (data first, then parity), with known blocks copied through.
-    pub fn recover(
-        &self,
-        blocks: &[Option<&[u8]>],
-    ) -> Result<Vec<Vec<u8>>, ReedSolomonError> {
+    pub fn recover(&self, blocks: &[Option<&[u8]>]) -> Result<Vec<Vec<u8>>, ReedSolomonError> {
         if blocks.len() != self.config.n() {
             return Err(ReedSolomonError::BlockCountMismatch {
                 expected: self.config.n(),
                 got: blocks.len(),
             });
         }
-        let block_size = blocks[0].map_or(0, |b| b.len());
-        for (i, b) in blocks.iter().enumerate() {
+        let block_size = blocks.iter().flatten().next().map_or(0, |b| b.len());
+        for b in blocks {
             match b {
                 None => {}
                 Some(block) if block.len() != block_size => {
@@ -271,14 +244,8 @@ impl ReedSolomon {
                 }
                 Some(_) => {}
             }
-            let _ = i;
         }
-        if block_size == 0 {
-            return Ok(vec![vec![]; self.config.n()]);
-        }
-
         let k = self.config.k;
-        let r = self.config.r;
         let n = self.config.n();
 
         let known: Vec<usize> = blocks
@@ -291,6 +258,9 @@ impl ReedSolomon {
                 have: known.len(),
                 need: k,
             });
+        }
+        if block_size == 0 {
+            return Ok(vec![vec![]; n]);
         }
         // Use the first k known positions as interpolation points.
         let pts: &[usize] = &known[..k];
@@ -315,34 +285,33 @@ impl ReedSolomon {
             }
         }
 
-        let missing: Vec<usize> = (0..n)
-            .filter(|i| blocks[*i].is_none())
-            .collect();
+        let missing: Vec<usize> = (0..n).filter(|i| blocks[*i].is_none()).collect();
         if missing.is_empty() {
             return Ok(result);
         }
 
         // For each byte position independently, interpolate the polynomial and
         // evaluate at each missing point.
-        for b in 0..block_size {
-            // values at the k known points
-            let known_vals: Vec<u8> = pts.iter().map(|j| blocks[*j].unwrap()[b]).collect();
-            for &j in &missing {
-                let x = self.eval_points[j];
+        for &j in &missing {
+            let x = self.eval_points[j];
+            for (b, output_byte) in result[j].iter_mut().enumerate() {
+                // values at the k known points
+                let known_vals: Vec<u8> =
+                    pts.iter().map(|point| blocks[*point].unwrap()[b]).collect();
                 let mut acc: u8 = 0;
-                for l in 0..k {
+                for (l, _) in pts.iter().enumerate() {
                     // L_l(x) = prod_{m != l} (x - alpha^pts[m]) / denom[l]
                     let mut num: u8 = 1;
-                    for m in 0..k {
+                    for (m, &other_point) in pts.iter().enumerate() {
                         if m == l {
                             continue;
                         }
-                        num = gf_mul(num, gf_sub(x, alpha_pow(pts[m])));
+                        num = gf_mul(num, gf_sub(x, alpha_pow(other_point)));
                     }
                     let basis = gf_div(num, denom[l]);
                     acc ^= gf_mul(known_vals[l], basis);
                 }
-                result[j][b] = acc;
+                *output_byte = acc;
             }
         }
         Ok(result)
@@ -358,7 +327,7 @@ mod tests {
     use super::*;
 
     fn cfg(k: usize, r: usize) -> ReedSolomon {
-        ReedSolomon::new(ReedSolomonConfig::new(k, r).unwrap())
+        ReedSolomon::new(ReedSolomonConfig::new(k, r).unwrap()).unwrap()
     }
 
     #[test]
@@ -391,7 +360,7 @@ mod tests {
         let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i as u8 + 1, 100, 200]).collect();
         let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
         let parity = rs.encode(&data_refs).unwrap();
-        let mut blocks: Vec<Option<&[u8]>> = vec![
+        let blocks: Vec<Option<&[u8]>> = vec![
             Some(&data[0]),
             None,
             Some(&data[2]),
@@ -431,13 +400,8 @@ mod tests {
         let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
         let parity = rs.encode(&data_refs).unwrap();
         // Erase data[1] and parity[1]
-        let mut blocks: Vec<Option<&[u8]>> = vec![
-            Some(&data[0]),
-            None,
-            Some(&data[2]),
-            Some(&parity[0]),
-            None,
-        ];
+        let blocks: Vec<Option<&[u8]>> =
+            vec![Some(&data[0]), None, Some(&data[2]), Some(&parity[0]), None];
         let recovered = rs.recover(&blocks).unwrap();
         assert_eq!(recovered[1], data[1]);
         assert_eq!(recovered[4], parity[1]);
@@ -447,14 +411,7 @@ mod tests {
     fn too_many_erasures_rejected() {
         let rs = cfg(3, 2);
         let data: Vec<Vec<u8>> = vec![vec![1; 4], vec![2; 4], vec![3; 4]];
-        let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
-        let blocks: Vec<Option<&[u8]>> = vec![
-            Some(&data[0]),
-            None,
-            None,
-            None,
-            None,
-        ];
+        let blocks: Vec<Option<&[u8]>> = vec![Some(&data[0]), None, None, None, None];
         let err = rs.recover(&blocks).unwrap_err();
         assert!(matches!(
             err,
@@ -466,7 +423,7 @@ mod tests {
     fn k_one_is_repetition_parity() {
         // k=1, r=2: parity[j] = data[0] (single evaluation point => constant poly)
         let rs = cfg(1, 2);
-        let data = vec![vec![42u8; 5]];
+        let data = [vec![42u8; 5]];
         let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
         let parity = rs.encode(&data_refs).unwrap();
         assert_eq!(parity[0], vec![42; 5]);
@@ -481,28 +438,36 @@ mod tests {
 
     #[test]
     fn random_round_trip_properties() {
+        use rand::seq::SliceRandom;
         use rand::{Rng, SeedableRng};
-    use rand::seq::SliceRandom;
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         for (k, r) in [(2, 1), (3, 3), (5, 2), (8, 4)] {
             let rs = cfg(k, r);
             let n = k + r;
             let bs = 17;
-            let data: Vec<Vec<u8>> = (0..k).map(|_| (0..bs).map(|_| rng.r#gen()).collect()).collect();
+            let data: Vec<Vec<u8>> = (0..k)
+                .map(|_| (0..bs).map(|_| rng.r#gen()).collect())
+                .collect();
             let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
             let parity = rs.encode(&data_refs).unwrap();
             let mut all: Vec<Vec<u8>> = data.clone();
             all.extend(parity);
             // Erase up to r distinct blocks, ensure recovery matches originals.
             let mut erased: Vec<bool> = vec![false; n];
-            let mut count = rng.gen_range(0..=r);
+            let count = rng.gen_range(0..=r);
             let mut idxs: Vec<usize> = (0..n).collect();
             idxs.shuffle(&mut rng);
             for &i in &idxs[..count] {
                 erased[i] = true;
             }
-            let mut blocks: Vec<Option<&[u8]>> = (0..n)
-                .map(|i| if erased[i] { None } else { Some(all[i].as_slice()) })
+            let blocks: Vec<Option<&[u8]>> = (0..n)
+                .map(|i| {
+                    if erased[i] {
+                        None
+                    } else {
+                        Some(all[i].as_slice())
+                    }
+                })
                 .collect();
             let recovered = rs.recover(&blocks).unwrap();
             for i in 0..n {

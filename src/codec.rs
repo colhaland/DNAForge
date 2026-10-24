@@ -26,15 +26,9 @@ impl Base {
 pub enum CodecError {
     /// The decoded base stream length is not a multiple of four bases,
     /// so it cannot be split into whole bytes.
-    IncompleteByte {
-        bases: usize,
-        remainder: usize,
-    },
+    IncompleteByte { bases: usize, remainder: usize },
     /// A base symbol outside the range 0..3 was encountered.
-    InvalidBase {
-        position: usize,
-        value: u8,
-    },
+    InvalidBase { position: usize, value: u8 },
 }
 
 impl std::fmt::Display for CodecError {
@@ -45,7 +39,10 @@ impl std::fmt::Display for CodecError {
                 "codec: {bases} bases is not a whole number of bytes (remainder {remainder})"
             ),
             CodecError::InvalidBase { position, value } => {
-                write!(f, "codec: invalid base value {value} at position {position}")
+                write!(
+                    f,
+                    "codec: invalid base value {value} at position {position}"
+                )
             }
         }
     }
@@ -96,7 +93,7 @@ pub fn encode_bytes(bytes: &[u8]) -> Vec<Base> {
 /// The base count must be a multiple of four. Groups of four bases are
 /// reassembled into one byte (most significant two bits first).
 pub fn decode_bases(bases: &[Base]) -> Result<Vec<u8>, CodecError> {
-    if bases.len() % 4 != 0 {
+    if !bases.len().is_multiple_of(4) {
         return Err(CodecError::IncompleteByte {
             bases: bases.len(),
             remainder: bases.len() % 4,
@@ -130,20 +127,19 @@ pub fn decode_string(s: &str) -> Result<Vec<u8>, CodecError> {
     let bases: Result<Vec<Base>, _> = s
         .chars()
         .enumerate()
-        .map(|(i, ch)| char_to_base(ch).ok_or_else(|| CodecError::InvalidBase {
-            position: i,
-            value: ch as u8,
-        }))
+        .map(|(i, ch)| {
+            char_to_base(ch).ok_or(CodecError::InvalidBase {
+                position: i,
+                value: ch as u8,
+            })
+        })
         .collect();
     let bases = bases?;
     decode_bases(&bases).map_err(|e| match e {
         CodecError::IncompleteByte { bases, remainder } => {
             CodecError::IncompleteByte { bases, remainder }
         }
-        CodecError::InvalidBase { position, value } => CodecError::InvalidBase {
-            position,
-            value,
-        },
+        CodecError::InvalidBase { position, value } => CodecError::InvalidBase { position, value },
     })
 }
 

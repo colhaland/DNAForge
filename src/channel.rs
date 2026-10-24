@@ -11,6 +11,8 @@
 use crate::codec::Base;
 use rand::{Rng, SeedableRng};
 
+pub const CHANNEL_MODEL_VERSION: &str = "1";
+
 /// Configuration for the DNA channel simulator.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChannelConfig {
@@ -77,8 +79,12 @@ pub enum ErrorEvent {
         position: usize,
         base: Base,
     },
-    Dropout { fragment_id: u64 },
-    Duplication { fragment_id: u64 },
+    Dropout {
+        fragment_id: u64,
+    },
+    Duplication {
+        fragment_id: u64,
+    },
 }
 
 /// Per-run error statistics.
@@ -123,10 +129,14 @@ impl std::error::Error for ChannelError {}
 /// Simulate the channel over a vector of fragments (each a vector of bases).
 /// Fragments are identified by their index in the input slice used as the
 /// fragment id.
-pub fn simulate(fragments: &[Vec<Base>], config: &ChannelConfig) -> Result<SimulationOutput, ChannelError> {
+pub fn simulate(
+    fragments: &[Vec<Base>],
+    config: &ChannelConfig,
+) -> Result<SimulationOutput, ChannelError> {
     config.validate()?;
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
     let mut output: Vec<Option<Vec<Base>>> = Vec::with_capacity(fragments.len());
+    let mut duplicates = Vec::new();
     let mut events = Vec::new();
     let mut stats = ErrorStats {
         input_fragments: fragments.len(),
@@ -138,12 +148,15 @@ pub fn simulate(fragments: &[Vec<Base>], config: &ChannelConfig) -> Result<Simul
         // Dropout: whole fragment lost.
         if rng.gen_bool(config.dropout_rate) {
             stats.dropouts += 1;
-            events.push(ErrorEvent::Dropout { fragment_id: frag_id as u64 });
+            events.push(ErrorEvent::Dropout {
+                fragment_id: frag_id as u64,
+            });
             output.push(None);
             continue;
         }
 
-        let (mut mutated, (mut events2, estats)) = process_sequence(fragment, &mut rng, frag_id as u64, config);
+        let (mutated, (mut events2, estats)) =
+            process_sequence(fragment, &mut rng, frag_id as u64, config);
         stats.substitutions += estats.substitutions;
         stats.insertions += estats.insertions;
         stats.deletions += estats.deletions;
@@ -152,33 +165,34 @@ pub fn simulate(fragments: &[Vec<Base>], config: &ChannelConfig) -> Result<Simul
 
         output.push(Some(mutated.clone()));
 
-        // Duplication: emit an extra identical copy.
+        // Keep duplicates attached to their source so they cannot shift the
+        // identity of subsequent fragments.
         if rng.gen_bool(config.duplication_rate) {
             stats.duplications += 1;
-            events.push(ErrorEvent::Duplication { fragment_id: frag_id as u64 });
-            output.push(Some(mutated));
+            events.push(ErrorEvent::Duplication {
+                fragment_id: frag_id as u64,
+            });
+            stats.output_bases += mutated.len();
+            duplicates.push((frag_id, mutated));
         }
     }
 
-    stats.output_fragments = output.iter().filter(|o| o.is_some()).count();
+    stats.output_fragments =
+        output.iter().filter(|fragment| fragment.is_some()).count() + duplicates.len();
 
     Ok(SimulationOutput {
         fragments: output,
+        duplicates,
         events,
         stats,
     })
 }
 
+#[derive(Default)]
 struct EventStats {
     substitutions: u64,
     insertions: u64,
     deletions: u64,
-}
-
-impl Default for EventStats {
-    fn default() -> Self {
-        Self { substitutions: 0, insertions: 0, deletions: 0 }
-    }
 }
 
 fn process_sequence(
@@ -252,6 +266,7 @@ fn random_base_different(rng: &mut impl Rng, exclude: Base) -> Base {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SimulationOutput {
     pub fragments: Vec<Option<Vec<Base>>>,
+    pub duplicates: Vec<(usize, Vec<Base>)>,
     pub events: Vec<ErrorEvent>,
     pub stats: ErrorStats,
 }
@@ -294,8 +309,16 @@ mod tests {
     #[test]
     fn different_seed_differs_likely() {
         let frags = vec![all_a(100)];
-        let c1 = ChannelConfig { substitution_rate: 0.5, seed: 1, ..Default::default() };
-        let c2 = ChannelConfig { substitution_rate: 0.5, seed: 2, ..Default::default() };
+        let c1 = ChannelConfig {
+            substitution_rate: 0.5,
+            seed: 1,
+            ..Default::default()
+        };
+        let c2 = ChannelConfig {
+            substitution_rate: 0.5,
+            seed: 2,
+            ..Default::default()
+        };
         let a = simulate(&frags, &c1).unwrap();
         let b = simulate(&frags, &c2).unwrap();
         assert_ne!(a.fragments, b.fragments);
@@ -304,7 +327,11 @@ mod tests {
     #[test]
     fn full_dropout() {
         let frags = vec![all_a(10), all_a(10)];
-        let cfg = ChannelConfig { dropout_rate: 1.0, seed: 7, ..Default::default() };
+        let cfg = ChannelConfig {
+            dropout_rate: 1.0,
+            seed: 7,
+            ..Default::default()
+        };
         let out = simulate(&frags, &cfg).unwrap();
         assert_eq!(out.fragments, vec![None, None]);
         assert_eq!(out.stats.dropouts, 2);
@@ -313,7 +340,7 @@ mod tests {
 
     #[test]
     fn duplication_keeps_identity() {
-        let frags = vec![vec![Base(0), Base(1), Base(2)]];
+        let frags = vec![vec![Base(0), Base(1), Base(2)], vec![Base(3)]];
         let cfg = ChannelConfig {
             duplication_rate: 1.0,
             seed: 3,
@@ -322,8 +349,12 @@ mod tests {
         let out = simulate(&frags, &cfg).unwrap();
         assert_eq!(out.fragments.len(), 2);
         assert_eq!(out.fragments[0], Some(frags[0].clone()));
-        assert_eq!(out.fragments[1], Some(frags[0].clone()));
-        assert_eq!(out.stats.duplications, 1);
+        assert_eq!(out.fragments[1], Some(frags[1].clone()));
+        assert_eq!(
+            out.duplicates,
+            vec![(0, frags[0].clone()), (1, frags[1].clone())]
+        );
+        assert_eq!(out.stats.duplications, 2);
     }
 
     #[test]
@@ -343,8 +374,11 @@ mod tests {
 
     #[test]
     fn invalid_rate_rejected() {
-        let cfg = ChannelConfig { substitution_rate: 1.5, ..Default::default() };
-        let err = simulate(&vec![all_a(4)], &cfg).unwrap_err();
+        let cfg = ChannelConfig {
+            substitution_rate: 1.5,
+            ..Default::default()
+        };
+        let err = simulate(&[all_a(4)], &cfg).unwrap_err();
         assert!(matches!(err, ChannelError::InvalidRate { .. }));
     }
 }

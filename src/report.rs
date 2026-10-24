@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 /// A single benchmark experiment row, suitable for CSV export.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct BenchmarkRow {
     pub experiment: String,
     pub seed: u64,
@@ -18,6 +18,13 @@ pub struct BenchmarkRow {
     pub fragment_size_bases: u64,
     pub ecc_k: u64,
     pub ecc_r: u64,
+    pub archive_format_version: u16,
+    pub channel_model_version: String,
+    pub substitution_rate: f64,
+    pub insertion_rate: f64,
+    pub deletion_rate: f64,
+    pub dropout_rate: f64,
+    pub duplication_rate: f64,
     pub encode_ms: u128,
     pub decode_ms: u128,
     pub simulate_ms: u128,
@@ -42,19 +49,26 @@ pub fn benchmarks_to_csv(rows: &[BenchmarkRow]) -> String {
     let mut out = String::new();
     writeln!(
         out,
-        "experiment,seed,input_bytes,dna_bases,fragment_size_bases,ecc_k,ecc_r,encode_ms,decode_ms,simulate_ms,recover_ms,total_ms,encode_mib_s,decode_mib_s,fragments_total,fragments_dropped,fragments_corrupted,fragments_recovered,fragments_unrecovered,exact_file_recovery,recovery_rate,encoded_bytes,overhead_percent,peak_rss_kb"
+        "experiment,seed,input_bytes,dna_bases,fragment_size_bases,ecc_k,ecc_r,archive_format_version,channel_model_version,substitution_rate,insertion_rate,deletion_rate,dropout_rate,duplication_rate,encode_ms,decode_ms,simulate_ms,recover_ms,total_ms,encode_mib_s,decode_mib_s,fragments_total,fragments_dropped,fragments_corrupted,fragments_recovered,fragments_unrecovered,exact_file_recovery,recovery_rate,encoded_bytes,overhead_percent,peak_rss_kb"
     ).unwrap();
     for row in rows {
         writeln!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{},{},{},{},{},{},{},{:.6},{:.6},{:?}",
-            row.experiment,
+            "{},{},{},{},{},{},{},{},{},{:.8},{:.8},{:.8},{:.8},{:.8},{},{},{},{},{},{:.6},{:.6},{},{},{},{},{},{},{:.6},{},{:.6},{:?}",
+            csv_field(&row.experiment),
             row.seed,
             row.input_bytes,
             row.dna_bases,
             row.fragment_size_bases,
             row.ecc_k,
             row.ecc_r,
+            row.archive_format_version,
+            csv_field(&row.channel_model_version),
+            row.substitution_rate,
+            row.insertion_rate,
+            row.deletion_rate,
+            row.dropout_rate,
+            row.duplication_rate,
             row.encode_ms,
             row.decode_ms,
             row.simulate_ms,
@@ -72,14 +86,28 @@ pub fn benchmarks_to_csv(rows: &[BenchmarkRow]) -> String {
             row.encoded_bytes,
             row.overhead_percent,
             row.peak_rss_kb,
-        ).unwrap();
+        )
+        .unwrap();
     }
     out
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\r', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
 }
 
 /// JSON summary of a benchmark run set.
 #[derive(Clone, Debug, Serialize)]
 pub struct BenchmarkSummary {
+    pub schema_version: String,
+    pub application_version: String,
+    pub target_os: String,
+    pub target_arch: String,
+    pub build_profile: String,
     pub created_at: String,
     pub rows: Vec<BenchmarkRow>,
     pub count: usize,
@@ -96,6 +124,16 @@ impl BenchmarkSummary {
             rows.iter().map(|r| r.recovery_rate).sum::<f64>() / rows.len() as f64
         };
         Self {
+            schema_version: "dnaforge-benchmark-v1".into(),
+            application_version: env!("CARGO_PKG_VERSION").into(),
+            target_os: std::env::consts::OS.into(),
+            target_arch: std::env::consts::ARCH.into(),
+            build_profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+            .into(),
             created_at: SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs().to_string())
@@ -173,6 +211,7 @@ mod tests {
             encoded_bytes: 150,
             overhead_percent: 50.0,
             peak_rss_kb: Some(1024),
+            ..Default::default()
         }];
         let csv = benchmarks_to_csv(&rows);
         assert!(csv.starts_with("experiment,seed,"));
@@ -181,45 +220,42 @@ mod tests {
     }
 
     #[test]
+    fn csv_escapes_delimiters_quotes_and_newlines() {
+        let row = BenchmarkRow {
+            experiment: "sample,\"one\"\nnext".into(),
+            ..Default::default()
+        };
+        let csv = benchmarks_to_csv(&[row]);
+        assert!(csv.contains("\"sample,\"\"one\"\"\nnext\""));
+    }
+
+    #[test]
+    fn json_summary_includes_schema_and_environment() {
+        let json = BenchmarkSummary::new(Vec::new()).to_json();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["schema_version"], "dnaforge-benchmark-v1");
+        assert_eq!(value["application_version"], env!("CARGO_PKG_VERSION"));
+        assert!(value["target_os"].is_string());
+        assert!(value["target_arch"].is_string());
+    }
+
+    #[test]
     fn summary_aggregates() {
         let rows = vec![
-            BenchmarkRow { exact_file_recovery: true, recovery_rate: 1.0, ..Default::default() },
-            BenchmarkRow { exact_file_recovery: false, recovery_rate: 0.5, ..Default::default() },
+            BenchmarkRow {
+                exact_file_recovery: true,
+                recovery_rate: 1.0,
+                ..Default::default()
+            },
+            BenchmarkRow {
+                exact_file_recovery: false,
+                recovery_rate: 0.5,
+                ..Default::default()
+            },
         ];
         let summary = BenchmarkSummary::new(rows);
         assert_eq!(summary.count, 2);
         assert_eq!(summary.exact_recoveries, 1);
         assert!((summary.mean_recovery_rate - 0.75).abs() < 1e-9);
-    }
-}
-
-impl Default for BenchmarkRow {
-    fn default() -> Self {
-        Self {
-            experiment: String::new(),
-            seed: 0,
-            input_bytes: 0,
-            dna_bases: 0,
-            fragment_size_bases: 0,
-            ecc_k: 0,
-            ecc_r: 0,
-            encode_ms: 0,
-            decode_ms: 0,
-            simulate_ms: 0,
-            recover_ms: 0,
-            total_ms: 0,
-            encode_mib_s: 0.0,
-            decode_mib_s: 0.0,
-            fragments_total: 0,
-            fragments_dropped: 0,
-            fragments_corrupted: 0,
-            fragments_recovered: 0,
-            fragments_unrecovered: 0,
-            exact_file_recovery: false,
-            recovery_rate: 0.0,
-            encoded_bytes: 0,
-            overhead_percent: 0.0,
-            peak_rss_kb: None,
-        }
     }
 }

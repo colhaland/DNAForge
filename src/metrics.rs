@@ -79,7 +79,13 @@ impl StorageMetrics {
         } else {
             dna_bases as f64 / original_bytes as f64
         };
-        Self { original_bytes, dna_bases, encoded_bytes, overhead_percent, bases_per_byte }
+        Self {
+            original_bytes,
+            dna_bases,
+            encoded_bytes,
+            overhead_percent,
+            bases_per_byte,
+        }
     }
 }
 
@@ -89,12 +95,7 @@ pub fn peak_rss_kb() -> Option<u64> {
     let contents = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("VmHWM:") {
-            let kb: u64 = rest
-                .trim()
-                .trim_end_matches("kB")
-                .trim()
-                .parse()
-                .ok()?;
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
             return Some(kb);
         }
     }
@@ -115,13 +116,21 @@ mod tests {
 
     #[test]
     fn throughput_zero_elapsed_is_zero() {
-        let m = StageMetric { name: "x".into(), elapsed_ms: 0, bytes_processed: 100 };
+        let m = StageMetric {
+            name: "x".into(),
+            elapsed_ms: 0,
+            bytes_processed: 100,
+        };
         assert_eq!(m.throughput_mib_per_s(), 0.0);
     }
 
     #[test]
     fn throughput_calculation() {
-        let m = StageMetric { name: "x".into(), elapsed_ms: 1000, bytes_processed: 2 * 1024 * 1024 };
+        let m = StageMetric {
+            name: "x".into(),
+            elapsed_ms: 1000,
+            bytes_processed: 2 * 1024 * 1024,
+        };
         assert!((m.throughput_mib_per_s() - 2.0).abs() < 1e-9);
     }
 
@@ -134,7 +143,11 @@ mod tests {
 
     #[test]
     fn recovery_rate() {
-        let r = ResilienceMetrics { fragments_total: 10, fragments_recovered: 8, ..Default::default() };
+        let r = ResilienceMetrics {
+            fragments_total: 10,
+            fragments_recovered: 8,
+            ..Default::default()
+        };
         assert!((r.recovery_rate_fragments() - 0.8).abs() < 1e-9);
         let empty = ResilienceMetrics::default();
         assert_eq!(empty.recovery_rate_fragments(), 0.0);

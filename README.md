@@ -29,17 +29,18 @@ Pada kondisi baseline yang terdokumentasi, `cargo test` belum lulus kompilasi te
 ## CLI
 
 ```bash
-cargo run -- encode input.bin archive/ --fragment-size 1024 --ecc-k 4 --ecc-r 2
-cargo run -- decode archive/ output.bin
-cargo run -- validate archive/ ignored-output
-cargo run -- simulate archive/ ignored-output --output corrupted/ --seed 42
-cargo run -- recover corrupted/ recovered.bin --original input.bin
-cargo run -- benchmark input.bin ignored-output --report report.csv
-cargo run -- inspect archive/ ignored-output
+cargo run -- encode input.bin --output archive/ --fragment-size 1024 --ecc-k 4 --ecc-r 2
+cargo run -- decode archive/ --output output.bin
+cargo run -- validate archive/
+cargo run -- simulate archive/ --output corrupted/ --seed 42
+cargo run -- recover corrupted/ --output recovered.bin --original input.bin
+cargo run -- benchmark input.bin --report report.csv --seeds 1,2,3
+cargo run -- benchmark ignored.bin --report synthetic.json --synthetic-sizes 1KiB,64KiB
+cargo run -- inspect archive/
 ```
 
-Argumen `INPUT OUTPUT` dipakai oleh seluruh subperintah saat ini karena memakai argumen CLI bersama; pada `simulate`, `benchmark`, dan `inspect`, output positional tidak menjadi tujuan hasil utama. Kontrak tersebut diketahui belum konsisten dan harus dirapikan sesuai spesifikasi sebelum CLI dinyatakan stabil. Opsi lengkap: `cargo run -- --help` dan `cargo run -- <command> --help`.
+Subperintah yang membuat berkas/arsip menerima tujuan eksplisit melalui `--output`; `validate` dan `inspect` hanya membutuhkan arsip. Benchmark memakai isi file input secara default. Opsi `--synthetic-sizes` secara eksplisit memilih data sintetis deterministik; `--seed` menentukan seed generator dan `--seeds` seed kanal tiap run. Opsi lengkap: `cargo run -- --help` dan `cargo run -- <command> --help`.
 
 ## Status
 
-Versi paket saat ini `0.1.0`. Format arsip v1 adalah baseline eksperimental, bukan kontrak kompatibilitas jangka panjang. Jangan gunakan untuk penyimpanan data produksi atau eksperimen fisik tanpa validasi tambahan.
+Versi paket saat ini `0.1.0`. Test unit/integration, `cargo fmt`, dan Clippy kini berjalan; CI menjalankannya pada Linux, macOS, dan Windows. Format arsip masih v1 eksperimental dan beberapa persyaratan integritas, ketahanan, metrik, serta kompatibilitas belum ditutup. Karena itu proyek belum dapat diklaim sebagai rilis produksi stabil. DNAForge adalah simulator komputasi saja—bukan DNA sintetis, bukti kelayakan laboratorium, atau jaminan ketahanan biologis.

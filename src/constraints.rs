@@ -85,14 +85,20 @@ pub fn max_homopolymer_run(bases: &[Base]) -> usize {
 
 /// Validate a sequence against `config`. Returns the status and a list of
 /// every violated constraint (not just the first).
-pub fn validate(bases: &[Base], config: ConstraintConfig) -> (ConstraintStatus, Vec<ConstraintViolation>) {
+pub fn validate(
+    bases: &[Base],
+    config: ConstraintConfig,
+) -> (ConstraintStatus, Vec<ConstraintViolation>) {
     let mut violations = Vec::new();
 
     let gc = gc_content(bases);
     if gc < config.gc_min || gc > config.gc_max {
         violations.push(ConstraintViolation {
             kind: ConstraintKind::GcContent,
-            detail: format!("GC content {gc:.4} outside [{}, {}]", config.gc_min, config.gc_max),
+            detail: format!(
+                "GC content {gc:.4} outside [{}, {}]",
+                config.gc_min, config.gc_max
+            ),
         });
     }
 
@@ -100,26 +106,29 @@ pub fn validate(bases: &[Base], config: ConstraintConfig) -> (ConstraintStatus, 
     if run > config.max_homopolymer {
         violations.push(ConstraintViolation {
             kind: ConstraintKind::Homopolymer,
-            detail: format!("homopolymer run of {run} exceeds limit {}", config.max_homopolymer),
+            detail: format!(
+                "homopolymer run of {run} exceeds limit {}",
+                config.max_homopolymer
+            ),
         });
     }
 
     let len = bases.len();
-    if let Some(min) = config.min_length {
-        if len < min {
-            violations.push(ConstraintViolation {
-                kind: ConstraintKind::Length,
-                detail: format!("length {len} below minimum {min}"),
-            });
-        }
+    if let Some(min) = config.min_length
+        && len < min
+    {
+        violations.push(ConstraintViolation {
+            kind: ConstraintKind::Length,
+            detail: format!("length {len} below minimum {min}"),
+        });
     }
-    if let Some(max) = config.max_length {
-        if len > max {
-            violations.push(ConstraintViolation {
-                kind: ConstraintKind::Length,
-                detail: format!("length {len} above maximum {max}"),
-            });
-        }
+    if let Some(max) = config.max_length
+        && len > max
+    {
+        violations.push(ConstraintViolation {
+            kind: ConstraintKind::Length,
+            detail: format!("length {len} above maximum {max}"),
+        });
     }
 
     let status = if violations.is_empty() {
@@ -132,7 +141,10 @@ pub fn validate(bases: &[Base], config: ConstraintConfig) -> (ConstraintStatus, 
 
 /// Validate and return only the first violation, if any. Convenience for
 /// fail-fast paths.
-pub fn validate_first(bases: &[Base], config: ConstraintConfig) -> Result<ConstraintStatus, ConstraintViolation> {
+pub fn validate_first(
+    bases: &[Base],
+    config: ConstraintConfig,
+) -> Result<ConstraintStatus, ConstraintViolation> {
     let (status, violations) = validate(bases, config);
     match violations.into_iter().next() {
         Some(v) => Err(v),
@@ -145,13 +157,15 @@ mod tests {
     use super::*;
 
     fn bases(s: &str) -> Vec<Base> {
-        s.chars().map(|c| match c {
-            'A' => Base(0),
-            'C' => Base(1),
-            'G' => Base(2),
-            'T' => Base(3),
-            _ => panic!("bad base in test"),
-        }).collect()
+        s.chars()
+            .map(|c| match c {
+                'A' => Base(0),
+                'C' => Base(1),
+                'G' => Base(2),
+                'T' => Base(3),
+                _ => panic!("bad base in test"),
+            })
+            .collect()
     }
 
     #[test]
@@ -195,7 +209,11 @@ mod tests {
         let (status, violations) = validate(&bases("AAAAAAAA"), cfg);
         assert_eq!(status, ConstraintStatus::Violated);
         assert!(!violations.is_empty());
-        assert!(violations.iter().any(|v| matches!(v.kind, ConstraintKind::GcContent)));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v.kind, ConstraintKind::GcContent))
+        );
     }
 
     #[test]
@@ -206,7 +224,11 @@ mod tests {
         };
         let (status, violations) = validate(&bases("AAACGT"), cfg);
         assert_eq!(status, ConstraintStatus::Violated);
-        assert!(violations.iter().any(|v| matches!(v.kind, ConstraintKind::Homopolymer)));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v.kind, ConstraintKind::Homopolymer))
+        );
     }
 
     #[test]
